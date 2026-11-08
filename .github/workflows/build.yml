@@ -1,0 +1,59 @@
+name: Run v2 Android CI & APK Verification
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.6'
+
+      - name: Build Debug & Release APKs
+        run: gradle assembleDebug assembleRelease --stacktrace
+
+      - name: Verify APK Byte-by-Byte (Size & SHA-256)
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: APK file not found at $APK_PATH"
+            exit 1
+          fi
+          BYTE_SIZE=$(stat -c%s "$APK_PATH")
+          SHA256_HASH=$(sha256sum "$APK_PATH" | awk '{print $1}')
+          echo "=========================================="
+          echo "Run v2 APK Verification Report"
+          echo "File: $APK_PATH"
+          echo "Exact Size: $BYTE_SIZE bytes"
+          echo "SHA-256: $SHA256_HASH"
+          echo "=========================================="
+          if [ "$BYTE_SIZE" -lt 1000000 ]; then
+            echo "ERROR: APK size ($BYTE_SIZE bytes) is suspiciously small!"
+            exit 1
+          fi
+          echo "$SHA256_HASH  app-debug.apk ($BYTE_SIZE bytes)" > app/build/outputs/apk/debug/APK-SHA256.txt
+
+      - name: Upload Verified APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-v2-verified-apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/APK-SHA256.txt

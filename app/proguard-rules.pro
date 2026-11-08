@@ -1,1 +1,3 @@
-# Run v2: no custom ProGuard rules yet (minify disabled in release).
+-keepattributes *Annotation*,InnerClasses,EnclosingMethod,Signature
+-keep class org.webrtc.** { *; }
+-dontwarn org.webrtc.**

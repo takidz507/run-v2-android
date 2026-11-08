@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Approved v2 Icon: Clean golden-amber (#E8A33D) letter R with soft fold and rounded corners on Warm Night (#171310) -->
+    <path
+        android:fillColor="#E8A33D"
+        android:pathData="M34,28 C34,25.8 35.8,24 38,24 L58,24 C69,24 76,30.5 76,40.5 C76,48.2 71.2,54.1 63.5,56.2 L74.8,76.5 C76.1,78.9 74.4,82 71.6,82 L64.2,82 C62.5,82 61.0,81.1 60.2,79.6 L50.2,57.5 L44,57.5 L44,78 C44,80.2 42.2,82 40,82 L38,82 C35.8,82 34,80.2 34,78 Z M44,33.5 L44,48.5 L57,48.5 C62.5,48.5 66,45.3 66,41 C66,36.7 62.5,33.5 57,33.5 Z" />
+    <!-- Subtle soft fold accent inside the R stem -->
+    <path
+        android:fillColor="#C68424"
+        android:pathData="M44,48.5 L53,48.5 L50.2,57.5 L44,57.5 Z" />
+</vector>

@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <dimen name="chat_text_size">14sp</dimen>
-    <dimen name="room_name_size">15sp</dimen>
-    <dimen name="room_last_message_size">13sp</dimen>
-    <dimen name="padding_screen">16dp</dimen>
-    <dimen name="card_corner_radius">12dp</dimen>
-    <dimen name="pin_dot_size">16dp</dimen>
-</resources>
