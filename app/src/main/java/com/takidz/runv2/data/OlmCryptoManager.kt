@@ -916,7 +916,7 @@ class OlmCryptoManager(private val sessionStore: SecureSessionStore) {
         if (b64.isBlank()) return
 
         val exportedKey = runCatching {
-            session.export(session.firstKnownIndex())
+            session.export(session.firstKnownIndex)
         }.getOrDefault("")
 
         val entry = JSONObject().apply {
@@ -926,7 +926,7 @@ class OlmCryptoManager(private val sessionStore: SecureSessionStore) {
             put("serialized_b64", b64)
             if (exportedKey.isNotBlank()) {
                 put("exported_session_key", exportedKey)
-                put("first_known_index", session.firstKnownIndex())
+                put("first_known_index", session.firstKnownIndex)
             }
         }
         vault.put("$roomId|$sessionId", entry)
@@ -984,7 +984,7 @@ class OlmCryptoManager(private val sessionStore: SecureSessionStore) {
             if (exportedKey.isBlank()) {
                 val sess = deserializeOlmObject<OlmInboundGroupSession>(entry.optString("serialized_b64"))
                 if (sess != null) {
-                    firstKnownIndex = runCatching { sess.firstKnownIndex() }.getOrDefault(0L)
+                    firstKnownIndex = runCatching { sess.firstKnownIndex }.getOrDefault(0L)
                     exportedKey = runCatching { sess.export(firstKnownIndex) }.getOrDefault("")
                 }
             }
