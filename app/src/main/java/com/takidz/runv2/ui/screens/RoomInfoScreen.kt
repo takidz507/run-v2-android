@@ -235,9 +235,9 @@ fun RoomInfoScreen(
                             type = "text/plain"
                             putExtra(
                                 Intent.EXTRA_TEXT,
-                                "انضم إلى غرفة "${room.name}" في تطبيق Run:
+                                """انضم إلى غرفة "${room.name}" في تطبيق Run:
 الرابط: $inviteLink
-الكود: ${room.roomCode}"
+الكود: ${room.roomCode}"""
                             )
                         }
                         context.startActivity(Intent.createChooser(shareIntent, "مشاركة دعوة Run"))

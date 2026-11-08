@@ -230,7 +230,7 @@ fun SearchScreen(
                             text = if (searchQuery.isBlank()) {
                                 "اكتب @username أو الاسم المعروض للبحث عن أصدقائك على السيرفر."
                             } else {
-                                "لا توجد نتائج مطابقة لـ "$searchQuery"."
+                                "لا توجد نتائج مطابقة لـ \"$searchQuery\"."
                             },
                             color = colors.inkSoft,
                             fontSize = 12.5.sp,
