@@ -1,48 +1,77 @@
-# Run v2 Android (Kotlin 2.0.0) — IMPLEMENTATION-NOTES
+# Run v2 Android (Kotlin + Jetpack Compose) — Implementation Notes (v2.1.0)
 
-## 1. نظرة عامة على البنية الهندسية
+## 1. ملخص التحديثات المنفذة في النسخة 2.1.0 (بصراحة تامة)
 
-تم بناء النسخة الحقيقية من تطبيق **Run v2 Android** (`com.takidz.runv2`) بلغة **Kotlin** وواجهة **Jetpack Compose** وفق التصميم المعتمد **Design B** (عمود واحد نظيف على طريقة Telegram، ثيم أساسي **Warm Night** `#171310` مع ذهبي كهرماني `#E8A33D`، وثيم فاتح مكمل **Warm Paper** `#FBF6EE`، وتبويبات سفلية ثابتة: `Rooms` / `Calls` / `Account`، وأيقونة النسخة الثانية المعتمدة بحرف `R`).
+تم تحديث المشروع بالكامل (`com.takidz.runv2`، 19 ملف كود مصدري Kotlin + إعدادات Gradle وGitHub Actions) لتنفيذ المهام الأربع المطلوبة بالترتيب:
 
-تلتزم هذه النسخة التزامًا صارمًا بقاعدة التكليف وملاحظات فحص الكود (موس):
-1. **صفر بيانات تجريبية أو وهمية (`PlaceholderData`)**: لا توجد أي غرف مسبقة مثل `Section D` أو `Study group` أو `Amine`. عند تسجيل الدخول بحساب جديد، تظهر قائمة الغرف فارغة تمامًا حتى ينشئ المستخدم غرفة أو ينضم إليها فعليًا.
-2. **إخفاء السيرفر والبروتوكول تمامًا عن الواجهة**: العنوان `https://matrix.tchncs.de` والنطاق `tchncs.de` محصوران داخليًا في الكائن `RunConfig.kt` فقط، ولا يظهر في أي شاشة أو رسالة خطأ أي ذكر لـ `Matrix` أو `tchncs.de` أو `server` أو `protocol`. يرى المستخدم فقط `@username` وعبارة `Run account`.
-3. **عدم ادّعاء تشفير E2E غير مكتمل (`isEncrypted = false` افتراضيًا)**:
-   - تُرسل الرسائل افتراضيًا عبر حدث Matrix القياسي `m.room.message` (`encryptWithRoomKey = false`)، وبما أن بروتوكول تبادل المفاتيح المتقاطع `Olm/Megolm` الكامل غير مدمج في هذه النسخة، فلا ندّعي وجود تشفير طرف-لطرف (E2EE) كامل للرسائل.
-   - تم ضبط الحقل `isEncrypted` ليكون `false` افتراضيًا في جميع النماذج (`Models.kt`)، وفي `MatrixApiClient.kt` (سواء في `sync` عبر `roomEncryptedCache[roomId] ?: false`، أو في `sendRoomMessage` حيث يأخذ قيمة `encryptWithRoomKey` الفعلية أي `false`، أو في `createGroupRoom`)، وكذلك في `RunViewModel.kt` داخل `joinRoomByCodeOrId` (join fallback) و `openOrStartDirectChatWithUser`، مع إزالة أي عبارة في الواجهة توحي بأن الغرفة أو الرسالة مشفّرة بينما هي نص عادي.
+### المهمة 0: السيرفر الجديد (`unredacted.org`)
+- **ما تم فعلاً في الكود:**
+  - تحديث `RunConfig.kt`:
+    - `HOMESERVER_BASE_URL = "https://matrix.unredacted.org"`
+    - `SERVER_DOMAIN = "unredacted.org"`
+  - إبقاء إخفاء السيرفر والبروتوكول مطبقاً بالكامل في واجهة المستخدم (المستخدم يرى `@username` و`Run account` فقط، ولا يظهر `unredacted.org` أو `Matrix` في الواجهة).
+  - الإبقاء على التسجيل والدخول القياسي بالطريقة العادية (`/_matrix/client/v3/register` مع `m.login.dummy` UIAA و`/_matrix/client/v3/login` بـ `m.login.password` — اسم مستخدم وكلمة سر فقط، بلا MAS وبلا موافقة مشرف).
+  - مسارات المزامنة (`/_matrix/client/v3/sync`)، إنشاء الغرف (`/_matrix/client/v3/createRoom`)، الانضمام (`/_matrix/client/v3/join/{roomIdOrAlias}`)، والبحث عن الأصدقاء والغرف العامة (`/_matrix/client/v3/user_directory/search` و`/_matrix/client/v3/publicRooms`) متصلة كلها بـ `https://matrix.unredacted.org`.
 
-## 2. حالة التنفيذ ملفًا بملف (File-by-File Status)
+### المهمة 1: التشفير الحقيقي للرسائل من الطرف إلى الطرف (Olm/Megolm) المتوافق مع Element
+- **ما تم فعلاً في الكود:**
+  - إضافة المكتبة الرسمية المعتمدة لتشفير Matrix على أندرويد في `app/build.gradle.kts`:
+    - `implementation("org.matrix.android:olm-sdk:3.2.11")` (مكتبة `libolm` الرسمية من Matrix مع الـ JNI bindings لـ Kotlin/Java، الموجودة على Maven Central).
+    - إضافة قواعد ProGuard في `app/proguard-rules.pro` (`-keep class org.matrix.olm.** { *; }`).
+  - إنشاء ملف **`OlmCryptoManager.kt`** (`app/src/main/java/com/takidz/runv2/data/OlmCryptoManager.kt`) الذي ينفذ بروتوكول Olm/Megolm القياسي المعتمد في Matrix والمتوافق مع **Element**:
+    1. **مفاتيح الجهاز (`OlmAccount`) وتوقيع Canonical JSON (`OlmUtility`)**:
+       - توليد وحفظ حساب `OlmAccount` محلياً داخل `EncryptedSharedPreferences` (`SecureSessionStore.kt`).
+       - استخراج مفاتيح الهوية القياسية للجهاز (`curve25519` و`ed25519`) وتوليد المفاتيح أحادية الاستخدام (`signed_curve25519`).
+       - تنفيذ محول **Matrix Canonical JSON** المطابق للمواصفة الرسمية (ترتيب المفاتيح أبجدياً بترميز UTF-8 بدون مسافات زائدة وحذف `signatures` و`unsigned` قبل التوقيع) وتوقيعه بمفتاح `ed25519` عبر `OlmAccount.signMessage(...)`.
+       - رفع مفاتيح الجهاز والمفاتيح أحادية الاستخدام تلقائياً عبر `POST /_matrix/client/v3/keys/upload` عند الدخول أو التسجيل وخلال `/sync` عندما ينخفض رصيد `device_one_time_keys_count`.
+    2. **التحقق من الأجهزة (`Device Verification`)**:
+       - جلب مفاتيح أجهزة الأعضاء عبر `POST /_matrix/client/v3/keys/query` عند تغير `device_lists.changed` أو قبل إرسال رسالة مشفرة أو عند فتح شاشة تفاصيل الغرفة.
+       - التحقق رياضياً من توقيع `ed25519` لكل جهاز ولـ `signed_curve25519` عبر `OlmUtility.verifyEd25519Signature(...)`.
+       - عرض بصمة المفتاح (`Ed25519 Fingerprint` مقسمة إلى مجموعات من 4 محارف) في شاشة الحساب (`AccountScreen`) وفي شاشة تفاصيل الغرفة (`RoomInfoScreen`) مع زر لتوثيق الجهاز يدوياً (`توثيق الجهاز` / `موثّق ✓`).
+    3. **تبادل مفاتيح الغرف عبر Olm (`m.olm.v1.curve25519-aes-sha2`)**:
+       - قبل إرسال رسالة في غرفة مشفرة، يتحقق `MatrixApiClient` من الأجهزة التي لم تستلم مفتاح جلسة Megolm الحالي (`m.room_key`)، ويطلب مفاتيح `signed_curve25519` للأجهزة الجديدة عبر `POST /_matrix/client/v3/keys/claim`، وينشئ جلسة `OlmSession` (`initOutboundSession`)، ثم يشفر حدث `m.room_key` ويرسله عبر `PUT /_matrix/client/v3/sendToDevice/m.room.encrypted/{txnId}`.
+       - عند استقبال أحداث `to_device` في `/sync` (سواء من تطبيق **Element** أو من جهاز **Run** آخر)، يقوم `OlmCryptoManager.processIncomingToDeviceEvents(...)` بفك تشفير رسائل Olm (`PRE_KEY` من النوع `0` أو الرسائل العادية من النوع `1`)، ويستخرج `m.room_key` أو `m.forwarded_room_key`، وينشئ `OlmInboundGroupSession` ويحفظه محلياً قبل معالجة رسائل الغرفة.
+    4. **تشفير وفك تشفير رسائل الغرف عبر Megolm (`m.megolm.v1.aes-sha2`)**:
+       - الرسائل في الغرف المشفرة تُشفر عبر `OlmOutboundGroupSession.encryptMessage(...)` لبنية حدث `m.room.message` القياسية، وتُرسل كحدث `m.room.encrypted` بالحقول القياسية (`algorithm: "m.megolm.v1.aes-sha2"`, `sender_key`, `ciphertext`, `session_id`, `device_id`) بحيث يفك تطبيق **Element** تشفيرها مباشرة.
+       - الرسائل المشفرة الواردة من **Element** أو **Run** تُفك عبر `OlmInboundGroupSession.decryptMessage(ciphertext)`.
+    5. **ربط النسخة الاحتياطية برمز PIN (من 6 أرقام) بمفاتيح Megolm الحقيقية**:
+       - تم حذف تشفير AES المخصص للرسائل نهائياً من `PinKeyBackupManager.kt`.
+       - الآن يقوم `PinKeyBackupManager.kt` بتصدير جميع جلسات Megolm الحقيقية عبر الدالة القياسية `OlmInboundGroupSession.export(firstKnownIndex)`، ثم يشفر حزمة المفاتيح المصدرة باستخدام الرمز السري المكون من 6 أرقام (`PBKDF2WithHmacSHA256` بـ 120,000 دورة + `AES-256-GCM`) ويرفعها إلى Account Data (`m.runv2.key_backup.v2`).
+       - عند إدخال رمز PIN على هاتف جديد، يفك `PinKeyBackupManager` تشفير النسخة الاحتياطية ويستورد جميع مفاتيح الجلسات عبر `OlmInboundGroupSession.importSession(exportedSessionKey)`.
+    6. **تفعيل التشفير افتراضياً في الغرف الجديدة والصدق التام في الواجهة**:
+       - عند إنشاء غرفة جماعية (`createGroupRoom`) أو محادثة خاصة (`createOrOpenDirectChat`)، يتم إرسال حدث الحالة `m.room.encryption` (`algorithm: "m.megolm.v1.aes-sha2"`) في `initial_state` افتراضياً.
+       - يتحقق التطبيق فعلياً من حالة الغرفة عبر `/_matrix/client/v3/rooms/{roomId}/state/m.room.encryption`.
+       - إذا كانت الغرفة غير مشفرة أو لم تقبل التشفير، تعرض الواجهة في `ChatScreen` و`RoomInfoScreen` بصراحة: `⚠️ هذه الغرفة غير مشفرة — الرسائل فيها تُرسل بدون تشفير طرف-لطرف`، وتُرسل الرسائل كـ `m.room.message` مع `isEncrypted = false` بدون علامة القفل `🔒`.
 
-| الملف | الوظيفة وما هو منفّذ برمجيًا فيه |
-| :--- | :--- |
-| `app/src/main/java/com/takidz/runv2/data/RunConfig.kt` | الثوابت الداخلية للسيرفر (`https://matrix.tchncs.de`) ودوال التحويل بين المعرّف الظاهر للمستخدم (`@username`) والمعرّف الداخلي، وتحويل أكواد الغرف وروابط الدعوة `run://join/<code>` و `run://friend/@username`. |
-| `app/src/main/java/com/takidz/runv2/data/Models.kt` | نماذج البيانات الموحدة المتطابقة عبر كل الطبقات (`RunAccount`, `RoomSummary`, `ChatMessage`, `RoomMember`, `UserSearchResult`, `PublicRoomResult`, `FriendRequestItem`, `CallLogEntry`, `ActiveCallState`, `TurnCredentials`, `SignalingEvent`) مع ضبط `isEncrypted = false` افتراضيًا. |
-| `app/src/main/java/com/takidz/runv2/data/SecureSessionStore.kt` | تخزين مشفّر للجلسة عبر `EncryptedSharedPreferences` (`AES256_SIV` للمفاتيح و `AES256_GCM` للقيم). يحفظ رمز الجلسة `access_token`، ومعرّف الجهاز، وخزنة PIN، وإعدادات جودة المكالمة، وسجل المكالمات دون حفظ كلمة المرور بنص صريح أبدًا. |
-| `app/src/main/java/com/takidz/runv2/data/PinKeyBackupManager.kt` | إدارة رمز PIN المكون من 6 أرقام واشتقاق مفتاح التشفير عبر `PBKDF2WithHmacSHA256` (بـ 120,000 دورة) مع تشفير الخزنة بـ `AES/GCM/NoPadding` (256-bit) لرفعها واستعادتها من بيانات الحساب على السيرفر (`m.runv2.key_backup.v2`). |
-| `app/src/main/java/com/takidz/runv2/data/MatrixApiClient.kt` | الطبقة الشبكية الكاملة (`OkHttp` + `Coroutines`): تسجيل الدخول (`/v3/login`)، إنشاء حساب باسم مستخدم وكلمة مرور فقط (`/v3/register` مع دعم `m.login.dummy`)، المزامنة المستمرة (`/v3/sync`)، جلب سجل الرسائل (`/messages`)، إرسال الرسائل النصية القياسية (`m.room.message` مع `isEncrypted = false` افتراضيًا)، إنشاء غرف جماعية بكود دائم (`/v3/createRoom`)، الانضمام للغرف بالمعرّف أو الكود (`/v3/join/{roomIdOrAlias}`)، جلب الأعضاء (`/members`)، البحث عن الأصدقاء بالاسم المعروض و `@username` (`/v3/user_directory/search` + `/v3/profile`)، البحث في الغرف العامة بالاسم والكود (`/v3/publicRooms` + `/v3/directory/room`)، الحضور (`/v3/presence`)، وجلب بيانات TURN للمكالمات (`/v3/voip/turnServer`). |
-| `app/src/main/java/com/takidz/runv2/webrtc/WebRtcCallManager.kt` | طبقة مكالمات الفيديو والصوت الفردية (1-إلى-1) عبر `org.webrtc` (`PeerConnectionFactory`, `Camera2Enumerator`, `SurfaceViewRenderer`, `AudioManager`) باستخدام بيانات `TURN` القادمة من السيرفر، مع تطبيق إعدادات الجودة (`480p` افتراضي، أو `Data saver 240p`، أو `Audio only`)، وكتم الميكروفون، وتشغيل/إيقاف الكاميرا، ومكبر الصوت، وإنهاء الاتصال. |
-| `app/src/main/java/com/takidz/runv2/ui/RunViewModel.kt` | يربط شاشات الواجهة بطبقة `MatrixApiClient` و `WebRtcCallManager` و `PinKeyBackupManager`، ويدير حلقة المزامنة (`startSyncLoop`)، والروابط العميقة `run://join/<code>`، وإشارات المكالمات (`m.call.invite`, `m.call.answer`, `m.call.candidates`, `m.call.hangup`)، مع ضبط `isEncrypted = false` في جميع حالات الـ fallback. |
-| `app/src/main/java/com/takidz/runv2/ui/theme/Theme.kt` | ألوان وخطوط **Design B**: ثيم **Warm Night** (`#171310` مع `#E8A33D`) وثيم **Warm Paper** (`#FBF6EE`)، وخط رسائل صغير ونظيف (`13.5sp`). |
-| `app/src/main/java/com/takidz/runv2/ui/screens/*.kt` | شاشات `LoginScreen`, `PinScreen`, `RoomsScreen`, `SearchScreen`, `CreateRoomScreen`, `ChatScreen`, `RoomInfoScreen`, و `CallsAndAccountScreens` خالية تمامًا من أي ادّعاء بتشفير E2EE غير مفعّل ومن أي بيانات تجريبية. |
-| `app/src/main/java/com/takidz/runv2/MainActivity.kt` | نقطة الدخول الرئيسية، تستقبل الروابط العميقة `run://join/<code>` و `run://friend/@username`، وتطلب صلاحيات الكاميرا والميكروفون عند بدء المكالمة، وتعرض التبويبات السفلية الثابتة `Rooms` / `Calls` / `Account`. |
+### المهمة 2: المكالمات (تبقى كما هي + فحص TURN على السيرفر الجديد)
+- **ما تم فعلاً في الكود:**
+  - لم يتم تغيير كود محرك المكالمات `WebRtcCallManager.kt` إطلاقاً (يبقى WebRTC 1-to-1، 480p افتراضي + توفير البيانات 240p + صوت فقط).
+  - بعد تسجيل الدخول وعند بدء المكالمة، يستعلم التطبيق من `https://matrix.unredacted.org/_matrix/client/v3/voip/turnServer` عبر `fetchTurnCredentials()`.
+  - إذا لم يرجع السيرفر عناوين TURN صالحة (`uris` فارغة أو خطأ)، يعرض التطبيق تنبيهاً صادقاً في تبويب المكالمات: `"تنبيه صادق: السيرفر لا يوفر بيانات TURN عبر /voip/turnServer حالياً (تعتمد المكالمات على STUN المباشر)"`.
 
-## 3. حالة التشفير (E2EE) وإصلاح ملاحظتي الفحص
+### المهمة 3: رسائل الخطأ الصادقة (`mapErrorToArabic`)
+- **ما تم فعلاً في الكود:**
+  - تم تحديث `mapErrorToArabic(rawResponse, httpCode, endpointPath)` في `MatrixApiClient.kt` ليفحص كلاً من `errcode`، نص `error` الوارد من السيرفر، `httpCode`، ومسار الطلب `endpointPath`:
+    - عندما يرجع التسجيل (`/_matrix/client/v3/register`) خطأ 403 `M_FORBIDDEN` مع `"Registration has been disabled"` (أو أي رفض تسجيل 403)، يعرض التطبيق بالضبط: **`"التسجيل مغلق على هذا السيرفر"`**، وليس `"اسم المستخدم أو كلمة المرور غير صحيحة"`.
+    - خطأ `"اسم المستخدم أو كلمة المرور غير صحيحة"` يظهر فقط عندما يفشل مسار `/login` بـ 403 `M_FORBIDDEN`.
+    - بقية الأخطاء (`M_USER_DEACTIVATED`, `M_USER_IN_USE`, `M_INVALID_USERNAME`, `M_EXCLUSIVE`, `M_WEAK_PASSWORD`, `M_UNKNOWN_TOKEN`, `M_ROOM_IN_USE`, `M_BAD_JSON`, `M_NOT_FOUND`, `M_LIMIT_EXCEEDED`, `M_TOO_LARGE`, وأخطاء الصلاحيات 403 في الغرف) تعرض السبب الحقيقي الدقيق بلا تضليل.
 
-1. **إرسال الرسائل وعدم ادّعاء Olm/Megolm**:
-   - تُرسل الرسائل عبر `sendRoomMessage` بالقيمة الافتراضية `encryptWithRoomKey = false` (حدث `m.room.message` قياسي).
-   - لم يتم تضمين محرك `Olm/Megolm` الكامل في هذه النسخة، ولذلك **تم ترك تشفير الرسائل الطرف-لطرف (E2EE) خارج ادعاءات هذه النسخة تمامًا** سواء في الكود أو في نصوص الواجهة أو في التوثيق.
-2. **تصحيح قيمة `isEncrypted` الافتراضية**:
-   - تم تغيير القيمة الافتراضية للحقل `isEncrypted` إلى `false` في `Models.kt`، وفي `MatrixApiClient.kt` (سواء في `sync` عبر `roomEncryptedCache[roomId] ?: false`، أو عند قراءة `m.room.message`، أو عند إرسال الرسالة `isEncrypted = encryptWithRoomKey`، أو عند إنشاء غرفة)، وفي `RunViewModel.kt` داخل `joinRoomByCodeOrId` (join fallback) و `openOrStartDirectChatWithUser`. بذلك لا تظهر أي غرفة أو رسالة على أنها مشفّرة وهي غير مشفّرة.
+---
 
-## 4. فقرة الاختبار الصريحة المنفصلة (Explicit Testing Report)
+## 2. ما لم يتم / حدود التنفيذ الحالية (بصراحة)
 
-التزامًا الصارم بقاعدة التسليم («لا تكتب "يعمل" عن أي شيء لم يُجرَّب»):
+1. **التحقق التفاعلي بالرموز التعبيرية (Interactive SAS Emoji Verification)**:
+   - التحقق من الأجهزة المنفذ حالياً يعتمد على التحقق الرياضي التلقائي من تواقيع `ed25519` (`OlmUtility.verifyEd25519Signature`) + مقارنة بصمة المفتاح (`Ed25519 Fingerprint`) يدوياً وتوثيق الجهاز بضغطة زر في شاشة تفاصيل الغرفة، ولم يتم إضافة جلسة التفاوض التفاعلية بالـ Emoji (`m.key.verification.sas`) في هذا الإصدار.
+2. **تدوير مفاتيح Megolm عند مغادرة عضو**:
+   - جلسة `OlmOutboundGroupSession` تتجدد تلقائياً بعد كل 200 رسالة أو عند عدم وجود جلسة سابقة، ولكن لم يتم ربط إعادة توليد الجلسة الفورية تلقائياً عند كل حدث مغادرة (`leave`/`ban`) في الغرف الجماعية الكبيرة.
 
-- **ما تم فحصه والتحقق منه برمجيًا فقط (Static & Cross-File Verification)**:
-  - مراجعة شاملة لتطابق الدوال والنماذج والأنواع والاستدعاءات عبر جميع ملفات المشروع.
-  - التأكد من خلو المشروع من أي `PlaceholderData` أو أسماء غرف/أشخاص وهمية (`Section D`, `Study group`, `Amine`).
-  - التأكد من إخفاء عنوان السيرفر (`https://matrix.tchncs.de`) داخل `RunConfig.kt` فقط.
-  - التأكد من ضبط `isEncrypted = false` افتراضيًا في كل مكان وعدم ادعاء تشفير E2E.
-- **ما لم يُجرَّب حيًّا بعد (Not Tested Live Yet)**:
-  - **لم يتم بناء ملف الـ APK بعد** (بانتظار الدفع إلى GitHub وتشغيل GitHub Actions).
-  - **لم يتم تجربة أي اتصال حي على السيرفر الحقيقي بعد**: لا تسجيل دخول حي، لا إرسال رسائل حي، لا بحث أو إضافة صديق حية، لا فتح رابط دعوة `run://join/<code>` حي، ولا مكالمة WebRTC حية بين جهازين. كل هذه الوظائف مكتوبة برمجيًا ومربوطة بنقاط النهاية الحقيقية في الكود، لكنها لم تُختبَر ميدانيًا بعد.
+---
+
+## 3. ما لم يُختبر حياً بعد (بصراحة تامة)
+
+بما أن بيئة البناء الحالية معزولة عن الإنترنت الخارجي ولا تحتوي على هاتف أندرويد حقيقي متصل:
+1. **لم يتم بناء ملف APK محلياً داخل هذه البيئة المعزولة**: ملفات Gradle و`.github/workflows/build.yml` مجهزة للبناء الكامل على GitHub Actions (حيث تتوفر مستودعات Google وMaven Central لتحميل `org.matrix.android:olm-sdk:3.2.11`).
+2. **لم يتم إجراء اتصال حي مباشر من هذه البيئة على `https://matrix.unredacted.org`**:
+   - لم نختبر حياً ما إذا كان سيرفر `unredacted.org` يفتح التسجيل العام حالياً أم يرجع 403 `Registration has been disabled` (وفي حال إرجاعه 403 سيظهر للمستخدم فوراً النص الصادق: `"التسجيل مغلق على هذا السيرفر"`).
+   - لم نختبر حياً ما إذا كان `https://matrix.unredacted.org/_matrix/client/v3/voip/turnServer` يرجع عناوين TURN مفعلة أم قائمة فارغة (وسيكتشف التطبيق ذلك تلقائياً فور الدخول ويعرض النتيجة بصراحة في تبويب المكالمات).
+3. **لم يتم إجراء تجربة حية متبادلة (Live Cross-Client Test) بين هاتف يشغل Run وهاتف يشغل Element على `unredacted.org` بعد**: الكود يلتزم حرفياً بمواصفة Matrix Olm (`m.olm.v1.curve25519-aes-sha2`) وMegolm (`m.megolm.v1.aes-sha2`) عبر مكتبة `olm-sdk` الرسمية، ويحتاج لتجربته حياً بعد بناء الـ APK في GitHub Actions.

@@ -23,8 +23,23 @@ data class RunAccount(
     val publicHandle: String,
     val displayName: String,
     val deviceId: String,
-    val isPinConfigured: Boolean
+    val isPinConfigured: Boolean,
+    val deviceEd25519Fingerprint: String = "",
+    val deviceCurve25519Key: String = ""
 )
+
+data class DeviceIdentity(
+    val userId: String,
+    val deviceId: String,
+    val curve25519Key: String,
+    val ed25519Key: String,
+    val displayName: String = "",
+    val signatureVerified: Boolean = false,
+    val manuallyVerified: Boolean = false
+) {
+    val formattedFingerprint: String
+        get() = ed25519Key.chunked(4).joinToString(" ")
+}
 
 data class RoomSummary(
     val roomId: String,
@@ -40,6 +55,7 @@ data class RoomSummary(
     val lastMessageTimestamp: Long,
     val unreadCount: Int,
     val isEncrypted: Boolean = false,
+    val encryptionStatusNote: String? = null,
     val avatarSeedColor: Long,
     val peerPresence: PresenceState = PresenceState.OFFLINE
 )
@@ -55,6 +71,7 @@ data class ChatMessage(
     val isOutgoing: Boolean,
     val isEncrypted: Boolean = false,
     val decryptionFailed: Boolean = false,
+    val senderDeviceVerified: Boolean = false,
     val isDelivered: Boolean = true
 )
 
@@ -65,7 +82,9 @@ data class RoomMember(
     val roleLabel: String,
     val membership: String, // "join" or "invite"
     val presence: PresenceState = PresenceState.OFFLINE,
-    val avatarSeedColor: Long
+    val avatarSeedColor: Long,
+    val verifiedDeviceCount: Int = 0,
+    val totalDeviceCount: Int = 0
 )
 
 data class UserSearchResult(
@@ -144,7 +163,8 @@ data class ActiveCallState(
     val isCameraEnabled: Boolean = true,
     val isSpeakerOn: Boolean = true,
     val remoteOfferSdp: String? = null,
-    val avatarSeedColor: Long = 0xFF8A6D3BL
+    val avatarSeedColor: Long = 0xFF8A6D3BL,
+    val turnServerAvailable: Boolean = true
 )
 
 data class TurnCredentials(
@@ -152,7 +172,10 @@ data class TurnCredentials(
     val username: String,
     val password: String,
     val ttlSeconds: Int
-)
+) {
+    val hasValidTurnServers: Boolean
+        get() = uris.isNotEmpty() && username.isNotBlank() && password.isNotBlank()
+}
 
 data class SignalingEvent(
     val type: String, // m.call.invite, m.call.answer, m.call.candidates, m.call.hangup
@@ -177,7 +200,9 @@ data class SyncResult(
     val outgoingFriendInvites: List<FriendRequestItem>,
     val friends: List<UserSearchResult>,
     val newMessagesByRoom: Map<String, List<ChatMessage>>,
-    val signalingEvents: List<SignalingEvent>
+    val signalingEvents: List<SignalingEvent>,
+    val oneTimeKeysCountCurve25519: Int = 0,
+    val changedDeviceUsers: List<String> = emptyList()
 )
 
 object AvatarPalette {

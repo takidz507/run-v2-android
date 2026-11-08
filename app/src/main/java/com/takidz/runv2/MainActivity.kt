@@ -208,6 +208,7 @@ fun RunV2RootApp(
                             MainTab.CALLS -> CallsScreen(
                                 callLogs = state.callLogs,
                                 callQualityMode = state.callQualityMode,
+                                turnStatusMessage = state.turnStatusMessage,
                                 onCallAgain = { roomId, isVideo ->
                                     val targetRoom = state.rooms.firstOrNull { it.roomId == roomId }
                                     if (targetRoom != null) {
@@ -296,6 +297,8 @@ fun RunV2RootApp(
                             RoomInfoScreen(
                                 room = activeRoom,
                                 members = state.activeRoomMembers,
+                                devices = state.activeRoomDevices,
+                                onVerifyDevice = { dev -> viewModel.markDeviceVerified(dev) },
                                 onBack = { viewModel.navigateToScreen(AppScreen.CHAT) }
                             )
                         }

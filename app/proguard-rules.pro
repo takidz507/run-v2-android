@@ -1,3 +1,5 @@
 -keepattributes *Annotation*,InnerClasses,EnclosingMethod,Signature
 -keep class org.webrtc.** { *; }
 -dontwarn org.webrtc.**
+-keep class org.matrix.olm.** { *; }
+-dontwarn org.matrix.olm.**

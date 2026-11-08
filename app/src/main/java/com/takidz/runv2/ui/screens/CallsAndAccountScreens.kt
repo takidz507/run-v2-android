@@ -27,7 +27,6 @@ import androidx.compose.material.icons.outlined.CallEnd
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.MicOff
-import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material.icons.outlined.VideocamOff
@@ -64,12 +63,14 @@ import org.webrtc.SurfaceViewRenderer
 /**
  * Design B Calls List Screen.
  * - Shows real call history (outgoing, incoming, missed) with durations and timestamps.
+ * - Displays honest TURN server availability status checked after login.
  * - Tapping a call entry initiates a real 1-to-1 WebRTC call in that room.
  */
 @Composable
 fun CallsScreen(
     callLogs: List<CallLogEntry>,
     callQualityMode: CallQualityMode,
+    turnStatusMessage: String? = null,
     onCallAgain: (roomId: String, isVideo: Boolean) -> Unit
 ) {
     val colors = LocalRunColors.current
@@ -95,6 +96,14 @@ fun CallsScreen(
                 color = colors.inkSoft,
                 fontSize = 12.5.sp
             )
+            if (!turnStatusMessage.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = turnStatusMessage,
+                    color = colors.accent,
+                    fontSize = 11.5.sp
+                )
+            }
         }
 
         if (callLogs.isEmpty()) {
@@ -374,7 +383,8 @@ private fun CallControlItem(
 /**
  * Design B Account & Settings Screen.
  * - Shows user's `@username` and "Run account" (zero server/Matrix mentions).
- * - PIN Creation / Backup & Restore on a new phone.
+ * - Displays Olm/Ed25519 Device Fingerprint for E2EE verification with Element.
+ * - PIN Creation / Backup & Restore of Megolm room keys on a new phone.
  * - Call Quality Settings: 480p default, Data saver, Audio-only (respected in WebRTC calls).
  * - Theme switcher: Warm Night (`#171310` + `#E8A33D`), Warm Paper, or System.
  */
@@ -443,23 +453,51 @@ fun AccountScreen(
             RunChip(text = "Run account")
         }
 
-        SectionLabel("الأمان والنسخة الاحتياطية (PIN)")
+        SectionLabel("التشفير (Olm/Megolm) والنسخة الاحتياطية (PIN)")
+
+        if (!account?.deviceEd25519Fingerprint.isNullOrBlank()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 6.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(colors.surface)
+                    .border(1.dp, colors.line, RoundedCornerShape(14.dp))
+                    .padding(13.dp)
+            ) {
+                Text(
+                    text = "بصمة مفتاح التشفير لهذا الجهاز (Ed25519) · المعرف: ${account?.deviceId.orEmpty()}",
+                    color = colors.inkSoft,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    Text(
+                        text = account?.deviceEd25519Fingerprint.orEmpty(),
+                        color = colors.accent,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
 
         SettingsRowItem(
             icon = Icons.Outlined.Lock,
-            title = "رمز PIN لنسخ المفاتيح احتياطيًا (6 أرقام)",
+            title = "رمز PIN لنسخ مفاتيح Megolm احتياطيًا (6 أرقام)",
             subtitle = if (account?.isPinConfigured == true) {
-                "مفعّل · اضغط لتحديث رمز PIN والنسخة المشفرة"
+                "مفعّل · اضغط لتحديث رمز PIN والنسخة المشفرة لمفاتيح الغرف"
             } else {
-                "غير مفعّل بعد · أنشئ رمز PIN لحفظ نسخة مفاتيحك المشفرة"
+                "غير مفعّل بعد · أنشئ رمز PIN لحفظ نسخة مفاتيح التشفير المشفرة"
             },
             onClick = onOpenPinCreate
         )
 
         SettingsRowItem(
             icon = Icons.Outlined.PhoneAndroid,
-            title = "استعادة المحادثات على هاتف جديد",
-            subtitle = "أدخل رمز PIN المكون من 6 أرقام لاسترجاع نسخة مفاتيحك (فقدان الرمز يعني فقدان النسخة نهائيًا)",
+            title = "استعادة المحادثات المشفرة على هاتف جديد",
+            subtitle = "أدخل رمز PIN المكون من 6 أرقام لاسترجاع مفاتيح Megolm (فقدان الرمز يعني فقدان النسخة نهائيًا)",
             onClick = onOpenPinRestore
         )
 

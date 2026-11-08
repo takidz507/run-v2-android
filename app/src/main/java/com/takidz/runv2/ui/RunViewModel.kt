@@ -10,9 +10,11 @@ import com.takidz.runv2.data.CallLogEntry
 import com.takidz.runv2.data.CallPhase
 import com.takidz.runv2.data.CallQualityMode
 import com.takidz.runv2.data.ChatMessage
+import com.takidz.runv2.data.DeviceIdentity
 import com.takidz.runv2.data.FriendRelationState
 import com.takidz.runv2.data.FriendRequestItem
 import com.takidz.runv2.data.MatrixApiClient
+import com.takidz.runv2.data.OlmCryptoManager
 import com.takidz.runv2.data.PinKeyBackupManager
 import com.takidz.runv2.data.PublicRoomResult
 import com.takidz.runv2.data.RoomMember
@@ -74,6 +76,7 @@ data class RunUiState(
     val activeRoom: RoomSummary? = null,
     val activeRoomMessages: List<ChatMessage> = emptyList(),
     val activeRoomMembers: List<RoomMember> = emptyList(),
+    val activeRoomDevices: List<DeviceIdentity> = emptyList(),
     // Search & Friends (strictly real server results)
     val searchQuery: String = "",
     val isSearching: Boolean = false,
@@ -82,7 +85,8 @@ data class RunUiState(
     val incomingFriendRequests: List<FriendRequestItem> = emptyList(),
     val outgoingFriendRequests: List<FriendRequestItem> = emptyList(),
     val friends: List<UserSearchResult> = emptyList(),
-    // Call logs & active WebRTC state
+    // Call logs, TURN server availability status & active WebRTC state
+    val turnStatusMessage: String? = null,
     val callLogs: List<CallLogEntry> = emptyList(),
     val activeCall: ActiveCallState = ActiveCallState()
 )
@@ -90,8 +94,9 @@ data class RunUiState(
 class RunViewModel(application: Application) : AndroidViewModel(application) {
 
     val sessionStore = SecureSessionStore(application)
-    val pinBackupManager = PinKeyBackupManager(sessionStore)
-    val apiClient = MatrixApiClient(sessionStore, pinBackupManager)
+    val olmCryptoManager = OlmCryptoManager(sessionStore)
+    val pinBackupManager = PinKeyBackupManager(sessionStore, olmCryptoManager)
+    val apiClient = MatrixApiClient(sessionStore, olmCryptoManager, pinBackupManager)
 
     private val _uiState = MutableStateFlow(
         RunUiState(
@@ -104,7 +109,13 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     publicHandle = RunConfig.toPublicHandle(uid),
                     displayName = sessionStore.getDisplayName(),
                     deviceId = sessionStore.getDeviceId().orEmpty(),
-                    isPinConfigured = sessionStore.isPinConfigured()
+                    isPinConfigured = sessionStore.isPinConfigured(),
+                    deviceEd25519Fingerprint = runCatching {
+                        olmCryptoManager.getFormattedDeviceFingerprint()
+                    }.getOrDefault(""),
+                    deviceCurve25519Key = runCatching {
+                        olmCryptoManager.getDeviceCurve25519Key()
+                    }.getOrDefault("")
                 )
             },
             callLogs = sessionStore.getCallLogs()
@@ -143,6 +154,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     init {
         if (sessionStore.isLoggedIn()) {
             startSyncLoop()
+            checkTurnServerStatusAfterLogin()
         }
     }
 
@@ -169,6 +181,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 startSyncLoop()
+                checkTurnServerStatusAfterLogin()
                 processPendingDeepLinkIfAny()
             }.onFailure { err ->
                 _uiState.update {
@@ -191,6 +204,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 startSyncLoop()
+                checkTurnServerStatusAfterLogin()
                 processPendingDeepLinkIfAny()
             }.onFailure { err ->
                 _uiState.update {
@@ -210,7 +224,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                         isLoading = false,
                         account = state.account?.copy(isPinConfigured = true),
                         currentScreen = AppScreen.MAIN_TABS,
-                        statusBanner = "تم حفظ نسخة مفاتيح التشفير برمز PIN الخاص بك"
+                        statusBanner = "تم حفظ نسخة مفاتيح التشفير (Megolm) برمز PIN الخاص بك"
                     )
                 }
             }.onFailure { err ->
@@ -225,13 +239,18 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
             val result = apiClient.restorePinKeyBackup(pin)
-            result.onSuccess {
+            result.onSuccess { restoredCount ->
                 _uiState.update { state ->
                     state.copy(
                         isLoading = false,
                         account = state.account?.copy(isPinConfigured = true),
-                        currentScreen = AppScreen.PIN_RESTORE_SUCCESS
+                        currentScreen = AppScreen.PIN_RESTORE_SUCCESS,
+                        statusBanner = "تمت استعادة $restoredCount مفتاح جلسة Megolm بنجاح"
                     )
+                }
+                // Re-fetch active room history if open so newly restored keys decrypt old messages
+                _uiState.value.activeRoom?.let { active ->
+                    openRoomChat(active)
                 }
             }.onFailure {
                 _uiState.update {
@@ -259,8 +278,28 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // =========================================================================
-    // 2. CONTINUOUS MATRIX /SYNC LOOP
+    // 2. CONTINUOUS MATRIX /SYNC LOOP & TURN CHECK
     // =========================================================================
+
+    private fun checkTurnServerStatusAfterLogin() {
+        viewModelScope.launch {
+            val turnRes = apiClient.fetchTurnCredentials()
+            turnRes.onSuccess { creds ->
+                val statusMsg = if (creds.hasValidTurnServers) {
+                    "خادم TURN جاهز للمكالمات (${creds.uris.size} عنوان)"
+                } else {
+                    "تنبيه صادق: السيرفر لا يوفر بيانات TURN عبر /voip/turnServer حالياً (تعتمد المكالمات على STUN المباشر)"
+                }
+                _uiState.update { it.copy(turnStatusMessage = statusMsg) }
+            }.onFailure {
+                _uiState.update {
+                    it.copy(
+                        turnStatusMessage = "تنبيه صادق: السيرفر لم يُرجع بيانات TURN عبر /voip/turnServer (تعتمد المكالمات على STUN المباشر)"
+                    )
+                }
+            }
+        }
+    }
 
     private fun startSyncLoop() {
         syncJob?.cancel()
@@ -319,7 +358,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // =========================================================================
-    // 3. ROOMS, MESSAGES, CREATION, INVITES & DEEP LINKS
+    // 3. ROOMS, E2EE MESSAGES, CREATION, INVITES & DEEP LINKS
     // =========================================================================
 
     fun openRoomChat(room: RoomSummary) {
@@ -332,6 +371,22 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
+            val isEnc = apiClient.checkRoomEncryptionEnabled(room.roomId)
+            val encNote = if (isEnc) null else "هذه الغرفة غير مشفرة (رسائل قياسية غير مشفرة)"
+            _uiState.update { state ->
+                val updatedActive = state.activeRoom?.let {
+                    if (it.roomId == room.roomId) {
+                        it.copy(isEncrypted = isEnc, encryptionStatusNote = encNote)
+                    } else it
+                }
+                state.copy(
+                    activeRoom = updatedActive,
+                    rooms = state.rooms.map { r ->
+                        if (r.roomId == room.roomId) r.copy(isEncrypted = isEnc, encryptionStatusNote = encNote) else r
+                    }
+                )
+            }
+
             apiClient.fetchRoomMessages(room.roomId, limit = 60).onSuccess { history ->
                 val list = messagesCache.getOrPut(room.roomId) { mutableListOf() }
                 val existingIds = list.map { it.eventId }.toHashSet()
@@ -354,8 +409,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val result = apiClient.sendRoomMessage(
                 roomId = activeRoom.roomId,
-                text = trimmed,
-                encryptWithRoomKey = false
+                text = trimmed
             )
             result.onSuccess { sentMsg ->
                 val list = messagesCache.getOrPut(activeRoom.roomId) { mutableListOf() }
@@ -370,7 +424,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                                 r.copy(
                                     lastMessageSender = "أنت",
                                     lastMessageBody = trimmed,
-                                    lastMessageTimestamp = sentMsg.timestamp
+                                    lastMessageTimestamp = sentMsg.timestamp,
+                                    isEncrypted = sentMsg.isEncrypted
                                 )
                             } else r
                         }.sortedByDescending { it.lastMessageTimestamp }
@@ -387,13 +442,32 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 currentScreen = AppScreen.ROOM_INFO,
-                activeRoomMembers = emptyList()
+                activeRoomMembers = emptyList(),
+                activeRoomDevices = emptyList()
             )
         }
         viewModelScope.launch {
             apiClient.fetchRoomMembers(room.roomId).onSuccess { members ->
-                _uiState.update { it.copy(activeRoomMembers = members) }
+                val devices = olmCryptoManager.getKnownDevicesForUsers(members.map { it.userId })
+                _uiState.update {
+                    it.copy(
+                        activeRoomMembers = members,
+                        activeRoomDevices = devices
+                    )
+                }
             }
+        }
+    }
+
+    fun markDeviceVerified(device: DeviceIdentity) {
+        olmCryptoManager.setDeviceManuallyVerified(device.userId, device.deviceId, !device.manuallyVerified)
+        val memberIds = _uiState.value.activeRoomMembers.map { it.userId }
+        val updatedDevices = olmCryptoManager.getKnownDevicesForUsers(memberIds)
+        _uiState.update {
+            it.copy(
+                activeRoomDevices = updatedDevices,
+                statusBanner = "تم تحديث حالة التحقق للجهاز ${device.deviceId}"
+            )
         }
     }
 
@@ -402,18 +476,27 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
             val result = apiClient.createGroupRoom(name, topic, selectedHandles)
             result.onSuccess { newRoom ->
-                // Also back up new room key if PIN is configured
                 _uiState.update { state ->
                     state.copy(
                         isLoading = false,
                         rooms = listOf(newRoom) + state.rooms,
                         activeRoom = newRoom,
                         currentScreen = AppScreen.ROOM_INFO,
-                        statusBanner = "تم إنشاء الغرفة بنجاح · الكود ${newRoom.roomCode}"
+                        statusBanner = if (newRoom.isEncrypted) {
+                            "تم إنشاء الغرفة المشفرة (Olm/Megolm) · الكود ${newRoom.roomCode}"
+                        } else {
+                            "تم إنشاء الغرفة (بدون تشفير) · الكود ${newRoom.roomCode}"
+                        }
                     )
                 }
                 apiClient.fetchRoomMembers(newRoom.roomId).onSuccess { members ->
-                    _uiState.update { it.copy(activeRoomMembers = members) }
+                    val devices = olmCryptoManager.getKnownDevicesForUsers(members.map { it.userId })
+                    _uiState.update {
+                        it.copy(
+                            activeRoomMembers = members,
+                            activeRoomDevices = devices
+                        )
+                    }
                 }
             }.onFailure { err ->
                 _uiState.update {
@@ -428,6 +511,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
             apiClient.joinRoomByCodeOrId(codeOrRoomId).onSuccess { joinedRoomId ->
                 val cleanCode = RunConfig.toPublicRoomCode(codeOrRoomId)
+                val isEnc = apiClient.isRoomCurrentlyEncrypted(joinedRoomId)
                 val fallbackSummary = _uiState.value.rooms.firstOrNull { it.roomId == joinedRoomId }
                     ?: RoomSummary(
                         roomId = joinedRoomId,
@@ -442,7 +526,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                         lastMessageBody = "انضممت إلى الغرفة",
                         lastMessageTimestamp = System.currentTimeMillis(),
                         unreadCount = 0,
-                        isEncrypted = false,
+                        isEncrypted = isEnc,
+                        encryptionStatusNote = if (isEnc) null else "هذه الغرفة غير مشفرة (رسائل قياسية غير مشفرة)",
                         avatarSeedColor = AvatarPalette.colorFor(joinedRoomId)
                     )
                 _uiState.update { state ->
@@ -581,7 +666,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                         },
                         outgoingFriendRequests = (listOf(newOutgoing) + state.outgoingFriendRequests)
                             .distinctBy { it.internalUserId },
-                        statusBanner = "تم إرسال طلب الصداقة إلى ${user.displayName}"
+                        statusBanner = "تم إرسال طلب الصداقة المشفر إلى ${user.displayName}"
                     )
                 }
             }.onFailure { err ->
@@ -604,6 +689,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
             apiClient.createOrOpenDirectChat(internalId).onSuccess { roomId ->
+                val isEnc = apiClient.isRoomCurrentlyEncrypted(roomId)
                 val summary = RoomSummary(
                     roomId = roomId,
                     name = displayName.ifBlank { RunConfig.toPublicHandle(internalId).removePrefix("@") },
@@ -614,10 +700,11 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     memberCount = 2,
                     onlineCount = 1,
                     lastMessageSender = null,
-                    lastMessageBody = "محادثة خاصة",
+                    lastMessageBody = if (isEnc) "محادثة خاصة مشفرة" else "محادثة خاصة (غير مشفرة)",
                     lastMessageTimestamp = System.currentTimeMillis(),
                     unreadCount = 0,
-                    isEncrypted = false,
+                    isEncrypted = isEnc,
+                    encryptionStatusNote = if (isEnc) null else "تعذر تفعيل التشفير في هذه الغرفة؛ الرسائل فيها غير مشفرة",
                     avatarSeedColor = AvatarPalette.colorFor(internalId)
                 )
                 _uiState.update { state ->
@@ -636,7 +723,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // =========================================================================
-    // 5. WEBRTC 1-TO-1 VIDEO & VOICE CALLS
+    // 5. WEBRTC 1-TO-1 VIDEO & VOICE CALLS (Task 2: Keep WebRTC as-is + TURN check)
     // =========================================================================
 
     fun startCallInActiveRoom(isVideoRequested: Boolean) {
@@ -666,6 +753,17 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             val turnCreds = apiClient.fetchTurnCredentials().getOrNull()
+            val hasTurn = turnCreds?.hasValidTurnServers == true
+            _uiState.update { state ->
+                state.copy(
+                    activeCall = state.activeCall.copy(turnServerAvailable = hasTurn),
+                    turnStatusMessage = if (hasTurn) {
+                        "خادم TURN متصل للمكالمة"
+                    } else {
+                        "تنبيه: السيرفر لا يوفر TURN حالياً؛ الاتصال يتم مباشرة عبر STUN/ICE"
+                    }
+                )
+            }
             webRtcCallManager.startOutgoingCall(
                 turnCredentials = turnCreds,
                 qualityMode = qualityMode,
@@ -696,6 +794,12 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             val turnCreds = apiClient.fetchTurnCredentials().getOrNull()
+            val hasTurn = turnCreds?.hasValidTurnServers == true
+            _uiState.update { state ->
+                state.copy(
+                    activeCall = state.activeCall.copy(turnServerAvailable = hasTurn)
+                )
+            }
             webRtcCallManager.answerIncomingCall(
                 offerSdp = offerSdp,
                 turnCredentials = turnCreds,
@@ -740,7 +844,6 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Persist real call log entry
         val logEntry = CallLogEntry(
             id = call.callId.ifBlank { UUID.randomUUID().toString() },
             roomId = call.roomId,

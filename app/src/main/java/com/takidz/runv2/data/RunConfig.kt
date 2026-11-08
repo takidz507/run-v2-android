@@ -3,19 +3,21 @@ package com.takidz.runv2.data
 /**
  * Internal network constants.
  * STRICT RULE: Never expose HOMESERVER_BASE_URL, SERVER_DOMAIN, "Matrix", "server",
- * or "protocol" in any user-facing string. The user only sees "@username" and "Run account".
+ * or "protocol" in any user-facing string (except explicit server-level error reporting).
+ * The user only sees "@username" and "Run account".
  */
 internal object RunConfig {
-    const val HOMESERVER_BASE_URL = "https://matrix.tchncs.de"
-    const val SERVER_DOMAIN = "tchncs.de"
+    const val HOMESERVER_BASE_URL = "https://matrix.unredacted.org"
+    const val SERVER_DOMAIN = "unredacted.org"
     const val ACCOUNT_DATA_KEY_BACKUP_EVENT = "m.runv2.key_backup.v2"
     const val ROOM_EVENT_ENCRYPTED = "m.room.encrypted"
+    const val OLM_ALGORITHM = "m.olm.v1.curve25519-aes-sha2"
     const val ROOM_ENCRYPTION_ALGORITHM = "m.megolm.v1.aes-sha2"
     const val APP_SCHEME = "run"
 
     /**
      * Converts a raw user input (e.g. "taki" or "@taki") into the full internal identifier
-     * required by the backend API ("@taki:tchncs.de").
+     * required by the backend API ("@taki:unredacted.org").
      */
     fun toInternalUserId(handleOrLocalpart: String): String {
         val clean = handleOrLocalpart.trim().removePrefix("@")
@@ -40,7 +42,7 @@ internal object RunConfig {
 
     /**
      * Converts a room code (e.g. "PHY-D5" or "run://join/PHY-D5") into an internal alias
-     * "#phy-d5:tchncs.de" or returns a room ID if it starts with '!'.
+     * "#phy-d5:unredacted.org" or returns a room ID if it starts with '!'.
      */
     fun toInternalRoomAliasOrId(codeOrLink: String): String {
         val cleaned = codeOrLink.trim()
@@ -55,7 +57,7 @@ internal object RunConfig {
     }
 
     /**
-     * Formats an internal alias "#code:tchncs.de" or roomId into a clean uppercase room code
+     * Formats an internal alias "#code:unredacted.org" or roomId into a clean uppercase room code
      * (e.g. "PHY-D5") with zero domain exposure.
      */
     fun toPublicRoomCode(aliasOrRoomId: String?): String {

@@ -13,23 +13,25 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
- * Real network client communicating with the approved backend (`https://matrix.tchncs.de`).
+ * Real network client communicating with the approved backend defined in RunConfig.
  *
  * Implements:
- * - Login & Registration (Username + Password only, zero email/phone, never logs passwords)
- * - Long-poll `/sync` for rooms, messages, presence, friend invites, and WebRTC call signaling
- * - Room message sending (both encrypted `m.room.encrypted` and standard `m.room.message`)
- * - Room history pagination (`/messages`)
- * - Group room creation with permanent room code alias (`#<code>:tchncs.de`)
- * - Room joining by roomId, alias, or `run://join/<code>`
- * - Friend search by `@username` and display name (`/user_directory/search` + profile lookup)
- * - Public room search by name and room code (`/publicRooms` + alias resolution)
- * - Presence updates and queries (`/presence/{userId}/status`)
- * - PIN-encrypted key backup upload & restore via Account Data (`m.runv2.key_backup.v2`)
- * - TURN server credentials (`/voip/turnServer`) and WebRTC signaling (`m.call.*`)
+ * - Login & Registration (Username + Password only, zero MAS/admin approval required, never logs passwords)
+ * - Full Matrix End-to-End Encryption (Olm/Megolm) interoperable with Element:
+ *   - `/_matrix/client/v3/keys/upload` (device Curve25519/Ed25519 keys & signed Curve25519 one-time keys)
+ *   - `/_matrix/client/v3/keys/query` (fetching & verifying remote users' device keys via Ed25519 signatures)
+ *   - `/_matrix/client/v3/keys/claim` (claiming signed one-time keys to establish 1-to-1 Olm sessions)
+ *   - `/_matrix/client/v3/sendToDevice/m.room.encrypted/{txnId}` (sharing `m.room_key` via Olm)
+ *   - Sending & receiving `m.room.encrypted` (`m.megolm.v1.aes-sha2`) room messages
+ *   - Enabling encryption by default (`m.room.encryption`) in newly created rooms and honestly reporting if a room is unencrypted
+ * - Long-poll `/sync` for rooms, messages, `to_device` Olm events, `device_lists`, presence, friend invites, and WebRTC signaling
+ * - PIN-encrypted Megolm key backup upload & restore via Account Data (`m.runv2.key_backup.v2`)
+ * - TURN server credentials (`/voip/turnServer`) with honest reporting if TURN is not configured on the server
+ * - Honest, cause-specific error mapping (`mapErrorToArabic`)
  */
 class MatrixApiClient(
     private val sessionStore: SecureSessionStore,
+    private val olmCryptoManager: OlmCryptoManager,
     private val pinBackupManager: PinKeyBackupManager
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -44,8 +46,11 @@ class MatrixApiClient(
     private val roomNameCache = mutableMapOf<String, String>()
     private val roomTopicCache = mutableMapOf<String, String>()
     private val roomAliasCache = mutableMapOf<String, String>()
+    // Strictly null until verified from state; never defaults to true unless m.room.encryption is present
     private val roomEncryptedCache = mutableMapOf<String, Boolean>()
+    private val roomEncryptionNoteCache = mutableMapOf<String, String>()
     private val roomMemberCountCache = mutableMapOf<String, Int>()
+    private val roomJoinedMembersCache = mutableMapOf<String, MutableSet<String>>()
     private val directPeerCache = mutableMapOf<String, String>()
     private val userDisplayNameCache = mutableMapOf<String, String>()
     private val userPresenceCache = mutableMapOf<String, PresenceState>()
@@ -83,6 +88,15 @@ class MatrixApiClient(
                     displayName = localpart
                 )
 
+                // Initialize local OlmAccount & upload device identity + one-time keys
+                olmCryptoManager.getOrCreateOlmAccount()
+                runCatching {
+                    ensureOlmKeysUploadedInternal(
+                        currentServerOneTimeKeyCount = 0,
+                        forceIncludeDeviceKeys = true
+                    )
+                }
+
                 // Fetch profile display name if set
                 val profileName = fetchDisplayNameInternal(userId) ?: localpart
                 sessionStore.updateDisplayName(profileName)
@@ -93,25 +107,32 @@ class MatrixApiClient(
                     publicHandle = RunConfig.toPublicHandle(userId),
                     displayName = profileName,
                     deviceId = deviceId,
-                    isPinConfigured = sessionStore.isPinConfigured()
+                    isPinConfigured = sessionStore.isPinConfigured(),
+                    deviceEd25519Fingerprint = olmCryptoManager.getFormattedDeviceFingerprint(),
+                    deviceCurve25519Key = olmCryptoManager.getDeviceCurve25519Key()
                 )
             }
         }
 
-    suspend fun register(handleOrUsername: String, passwordPlain: String, displayName: String? = null): Result<RunAccount> =
+    suspend fun register(
+        handleOrUsername: String,
+        passwordPlain: String,
+        displayName: String? = null
+    ): Result<RunAccount> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val localpart = RunConfig.toLocalpart(handleOrUsername)
                 require(localpart.length >= 3) { "اسم المستخدم يجب أن يتكون من 3 أحرف أو أرقام على الأقل" }
                 require(passwordPlain.length >= 6) { "كلمة المرور يجب أن تتكون من 6 أحرف على الأقل" }
 
+                val registerPath = "/_matrix/client/v3/register"
                 val firstBody = JSONObject().apply {
                     put("username", localpart)
                     put("password", passwordPlain)
                     put("initial_device_display_name", "Run v2 Android")
                 }
 
-                val url = "${RunConfig.HOMESERVER_BASE_URL}/_matrix/client/v3/register"
+                val url = "${RunConfig.HOMESERVER_BASE_URL}$registerPath"
                 val req1 = Request.Builder()
                     .url(url)
                     .post(firstBody.toString().toRequestBody(jsonMediaType))
@@ -122,8 +143,8 @@ class MatrixApiClient(
                     if (resp1.isSuccessful) {
                         JSONObject(raw1)
                     } else if (resp1.code == 401) {
-                        // Complete UIAA m.login.dummy stage if supported by homeserver
-                        val uiaa = JSONObject(raw1)
+                        // Complete UIAA m.login.dummy stage when required by standard Matrix registration
+                        val uiaa = runCatching { JSONObject(raw1) }.getOrNull() ?: JSONObject()
                         val session = uiaa.optString("session")
                         val secondBody = JSONObject().apply {
                             put("username", localpart)
@@ -141,12 +162,16 @@ class MatrixApiClient(
                         httpClient.newCall(req2).execute().use { resp2 ->
                             val raw2 = resp2.body?.string().orEmpty()
                             if (!resp2.isSuccessful) {
-                                throw IllegalStateException(mapErrorToArabic(raw2, resp2.code))
+                                throw IllegalStateException(
+                                    mapErrorToArabic(raw2, resp2.code, registerPath)
+                                )
                             }
                             JSONObject(raw2)
                         }
                     } else {
-                        throw IllegalStateException(mapErrorToArabic(raw1, resp1.code))
+                        throw IllegalStateException(
+                            mapErrorToArabic(raw1, resp1.code, registerPath)
+                        )
                     }
                 }
 
@@ -161,6 +186,16 @@ class MatrixApiClient(
                     deviceId = deviceId,
                     displayName = chosenDisplay
                 )
+
+                // Initialize local OlmAccount & upload device identity + one-time keys
+                olmCryptoManager.getOrCreateOlmAccount()
+                runCatching {
+                    ensureOlmKeysUploadedInternal(
+                        currentServerOneTimeKeyCount = 0,
+                        forceIncludeDeviceKeys = true
+                    )
+                }
+
                 runCatching { updateDisplayName(chosenDisplay) }
                 setPresenceOnlineInternal(userId)
 
@@ -169,7 +204,9 @@ class MatrixApiClient(
                     publicHandle = RunConfig.toPublicHandle(userId),
                     displayName = chosenDisplay,
                     deviceId = deviceId,
-                    isPinConfigured = false
+                    isPinConfigured = false,
+                    deviceEd25519Fingerprint = olmCryptoManager.getFormattedDeviceFingerprint(),
+                    deviceCurve25519Key = olmCryptoManager.getDeviceCurve25519Key()
                 )
             }
         }
@@ -177,12 +214,15 @@ class MatrixApiClient(
     suspend fun logout(): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             runCatching { executePost("/_matrix/client/v3/logout", JSONObject(), authenticated = true) }
+            olmCryptoManager.resetCryptoState()
             sessionStore.clearSession()
             roomNameCache.clear()
             roomTopicCache.clear()
             roomAliasCache.clear()
             roomEncryptedCache.clear()
+            roomEncryptionNoteCache.clear()
             roomMemberCountCache.clear()
+            roomJoinedMembersCache.clear()
             directPeerCache.clear()
         }
     }
@@ -198,8 +238,137 @@ class MatrixApiClient(
     }
 
     // =========================================================================
-    // 2. PIN KEY BACKUP (Upload & Restore via Account Data)
+    // 2. OLM/MEGOLM E2EE ENDPOINTS & 6-DIGIT PIN KEY BACKUP
     // =========================================================================
+
+    private fun ensureOlmKeysUploadedInternal(
+        currentServerOneTimeKeyCount: Int,
+        forceIncludeDeviceKeys: Boolean = false
+    ) {
+        val userId = sessionStore.getInternalUserId() ?: return
+        val deviceId = sessionStore.getDeviceId() ?: return
+        val uploadPayload = olmCryptoManager.buildKeysUploadPayload(
+            userId = userId,
+            deviceId = deviceId,
+            currentServerOneTimeKeyCount = currentServerOneTimeKeyCount,
+            forceIncludeDeviceKeys = forceIncludeDeviceKeys
+        ) ?: return
+
+        val hasDevKeys = uploadPayload.has("device_keys")
+        val hasOtks = uploadPayload.has("one_time_keys")
+        executePost("/_matrix/client/v3/keys/upload", uploadPayload)
+        olmCryptoManager.onKeysUploadSuccess(
+            uploadedDeviceKeys = hasDevKeys,
+            uploadedOneTimeKeys = hasOtks
+        )
+    }
+
+    suspend fun queryDevicesForUsers(userIds: Collection<String>): Result<List<DeviceIdentity>> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                queryDevicesForUsersInternal(userIds)
+            }
+        }
+
+    private fun queryDevicesForUsersInternal(userIds: Collection<String>): List<DeviceIdentity> {
+        val distinctUsers = userIds.filter { it.isNotBlank() }.distinct()
+        if (distinctUsers.isEmpty()) return emptyList()
+
+        val deviceKeysQuery = JSONObject()
+        distinctUsers.forEach { uid ->
+            deviceKeysQuery.put(uid, JSONArray())
+        }
+        val body = JSONObject().apply {
+            put("device_keys", deviceKeysQuery)
+            put("timeout", 10000)
+        }
+        val resp = executePost("/_matrix/client/v3/keys/query", body)
+        return olmCryptoManager.processKeysQueryResponse(resp)
+    }
+
+    /**
+     * Shares the room's current outbound Megolm session key (`m.room_key`) via 1-to-1 Olm
+     * (`m.olm.v1.curve25519-aes-sha2`) to all verified devices of members in `roomId`
+     * that haven't received this session yet. Interoperable with Element.
+     */
+    private fun shareMegolmSessionWithRoomMembersInternal(
+        roomId: String,
+        myUserId: String,
+        myDeviceId: String
+    ) {
+        val shareData = olmCryptoManager.getOrCreateOutboundRoomKeyShareData(roomId)
+
+        // Ensure we know the room's joined/invited members
+        val memberUserIds = getOrFetchRoomMemberUserIdsInternal(roomId, myUserId)
+        if (memberUserIds.isEmpty()) return
+
+        // Query latest device keys for members
+        runCatching { queryDevicesForUsersInternal(memberUserIds) }
+        val allMemberDevices = olmCryptoManager.getKnownDevicesForUsers(memberUserIds)
+            .filterNot { it.userId == myUserId && it.deviceId == myDeviceId }
+
+        val targetDevices = olmCryptoManager.filterDevicesMissingRoomSession(
+            roomId = roomId,
+            sessionId = shareData.sessionId,
+            devices = allMemberDevices
+        )
+        if (targetDevices.isEmpty()) return
+
+        // Claim signed_curve25519 one-time keys for any device without an existing OlmSession
+        val devicesNeedingOlmSession = targetDevices.filterNot {
+            olmCryptoManager.hasOlmSessionWithDevice(it.curve25519Key)
+        }
+        if (devicesNeedingOlmSession.isNotEmpty()) {
+            val oneTimeKeysRequest = JSONObject()
+            val lookupMap = mutableMapOf<Pair<String, String>, DeviceIdentity>()
+            for (dev in devicesNeedingOlmSession) {
+                val userDevObj = oneTimeKeysRequest.optJSONObject(dev.userId) ?: JSONObject()
+                userDevObj.put(dev.deviceId, "signed_curve25519")
+                oneTimeKeysRequest.put(dev.userId, userDevObj)
+                lookupMap[Pair(dev.userId, dev.deviceId)] = dev
+            }
+            val claimBody = JSONObject().apply {
+                put("one_time_keys", oneTimeKeysRequest)
+                put("timeout", 10000)
+            }
+            runCatching {
+                val claimResp = executePost("/_matrix/client/v3/keys/claim", claimBody)
+                olmCryptoManager.processClaimedOneTimeKeys(claimResp, lookupMap)
+            }
+        }
+
+        // Build Olm-encrypted `m.room.encrypted` to-device map for all target devices
+        val messagesMap = JSONObject()
+        val successfullyPreparedDevices = mutableListOf<DeviceIdentity>()
+
+        for (dev in targetDevices) {
+            val olmEncryptedContent = olmCryptoManager.buildOlmEncryptedRoomKeyToDeviceEvent(
+                myUserId = myUserId,
+                myDeviceId = myDeviceId,
+                recipientDevice = dev,
+                shareData = shareData
+            ) ?: continue
+
+            val userMap = messagesMap.optJSONObject(dev.userId) ?: JSONObject()
+            userMap.put(dev.deviceId, olmEncryptedContent)
+            messagesMap.put(dev.userId, userMap)
+            successfullyPreparedDevices.add(dev)
+        }
+
+        if (successfullyPreparedDevices.isNotEmpty()) {
+            val txnId = "olm_rk_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
+            val sendToDeviceBody = JSONObject().put("messages", messagesMap)
+            val encodedType = encodePathSegment(RunConfig.ROOM_EVENT_ENCRYPTED)
+            runCatching {
+                executePut("/_matrix/client/v3/sendToDevice/$encodedType/$txnId", sendToDeviceBody)
+                olmCryptoManager.markDevicesReceivedRoomSession(
+                    roomId = roomId,
+                    sessionId = shareData.sessionId,
+                    devices = successfullyPreparedDevices
+                )
+            }
+        }
+    }
 
     suspend fun uploadPinKeyBackup(pin: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
@@ -234,7 +403,7 @@ class MatrixApiClient(
     }
 
     // =========================================================================
-    // 3. REAL-TIME SYNC (Rooms, Messages, Presence, Invites, Call Signaling)
+    // 3. REAL-TIME SYNC (Rooms, Messages, To-Device Olm Keys, Presence, Calls)
     // =========================================================================
 
     suspend fun sync(sinceToken: String?, timeoutMs: Int = 15000): Result<SyncResult> =
@@ -255,7 +424,35 @@ class MatrixApiClient(
                     sessionStore.saveSyncBatchToken(nextBatch)
                 }
 
-                // 1. Parse Account Data (m.direct map + remote key backup)
+                // 0. Process incoming E2EE `to_device` events FIRST so Megolm room keys
+                // sent via Olm from Element or Run are available before decrypting timeline events!
+                val toDeviceEvents = root.optJSONObject("to_device")?.optJSONArray("events")
+                olmCryptoManager.processIncomingToDeviceEvents(toDeviceEvents, myUserId)
+
+                // Check server one-time key count and replenish if needed
+                val otkCountsObj = root.optJSONObject("device_one_time_keys_count")
+                val signedCurveCount = otkCountsObj?.optInt("signed_curve25519", 0) ?: 0
+                runCatching {
+                    ensureOlmKeysUploadedInternal(
+                        currentServerOneTimeKeyCount = signedCurveCount,
+                        forceIncludeDeviceKeys = !sessionStore.areDeviceKeysUploaded()
+                    )
+                }
+
+                // Refresh device keys for users whose device lists changed
+                val changedDeviceUsers = mutableListOf<String>()
+                val changedArr = root.optJSONObject("device_lists")?.optJSONArray("changed")
+                if (changedArr != null) {
+                    for (i in 0 until changedArr.length()) {
+                        val u = changedArr.optString(i)
+                        if (u.isNotBlank()) changedDeviceUsers.add(u)
+                    }
+                    if (changedDeviceUsers.isNotEmpty()) {
+                        runCatching { queryDevicesForUsersInternal(changedDeviceUsers) }
+                    }
+                }
+
+                // 1. Parse Account Data (m.direct map)
                 val accountDataEvents = root.optJSONObject("account_data")?.optJSONArray("events")
                 if (accountDataEvents != null) {
                     for (i in 0 until accountDataEvents.length()) {
@@ -323,6 +520,7 @@ class MatrixApiClient(
                             roomMemberCountCache[roomId] = joinedCount + invitedCount
                         }
 
+                        val memberSet = roomJoinedMembersCache.getOrPut(roomId) { mutableSetOf(myUserId) }
                         var invitedOtherUser: String? = null
                         var joinedOtherUser: String? = null
 
@@ -343,16 +541,14 @@ class MatrixApiClient(
                                     if (alias.isNotBlank()) roomAliasCache[roomId] = alias
                                 }
                                 "m.room.encryption" -> {
-                                    roomEncryptedCache[roomId] = true
-                                    val sharedKey = content.optString("run_shared_key_b64")
-                                    if (sharedKey.isNotBlank()) {
-                                        pinBackupManager.storeRoomSecretKeyBase64(roomId, sharedKey)
-                                    }
-                                }
-                                "m.runv2.room_key" -> {
-                                    val sharedKey = content.optString("key_b64")
-                                    if (sharedKey.isNotBlank()) {
-                                        pinBackupManager.storeRoomSecretKeyBase64(roomId, sharedKey)
+                                    val alg = content.optString("algorithm")
+                                    if (alg == RunConfig.ROOM_ENCRYPTION_ALGORITHM) {
+                                        roomEncryptedCache[roomId] = true
+                                        roomEncryptionNoteCache.remove(roomId)
+                                    } else {
+                                        roomEncryptedCache[roomId] = false
+                                        roomEncryptionNoteCache[roomId] =
+                                            "خوارزمية التشفير في هذه الغرفة غير مدعومة ($alg)"
                                     }
                                 }
                                 "m.room.member" -> {
@@ -361,6 +557,13 @@ class MatrixApiClient(
                                     val displayName = content.optString("displayname")
                                     if (stateKey.isNotBlank() && displayName.isNotBlank()) {
                                         userDisplayNameCache[stateKey] = displayName
+                                    }
+                                    if (stateKey.isNotBlank()) {
+                                        if (membership == "join" || membership == "invite") {
+                                            memberSet.add(stateKey)
+                                        } else if (membership == "leave" || membership == "ban") {
+                                            memberSet.remove(stateKey)
+                                        }
                                     }
                                     if (stateKey.isNotBlank() && stateKey != myUserId) {
                                         if (membership == "join") {
@@ -405,6 +608,7 @@ class MatrixApiClient(
                                         if (body.isNotBlank()) {
                                             val senderDisplay = userDisplayNameCache[sender]
                                                 ?: RunConfig.toPublicHandle(sender).removePrefix("@")
+                                            // Strictly unencrypted event: never claim isEncrypted = true
                                             val msg = ChatMessage(
                                                 eventId = eventId,
                                                 roomId = roomId,
@@ -414,7 +618,9 @@ class MatrixApiClient(
                                                 body = body,
                                                 timestamp = ts,
                                                 isOutgoing = sender == myUserId,
-                                                isEncrypted = false
+                                                isEncrypted = false,
+                                                decryptionFailed = false,
+                                                senderDeviceVerified = false
                                             )
                                             roomMessages.add(msg)
                                             lastSenderName = if (sender == myUserId) "أنت" else senderDisplay
@@ -423,8 +629,14 @@ class MatrixApiClient(
                                         }
                                     }
                                     RunConfig.ROOM_EVENT_ENCRYPTED -> {
-                                        roomEncryptedCache[roomId] = true
-                                        val (decryptedBody, failed) = pinBackupManager.decryptRoomMessage(roomId, content)
+                                        if (content.optString("algorithm") == RunConfig.ROOM_ENCRYPTION_ALGORITHM) {
+                                            roomEncryptedCache[roomId] = true
+                                        }
+                                        val outcome = olmCryptoManager.decryptMegolmRoomMessage(
+                                            roomId = roomId,
+                                            senderUserId = sender,
+                                            content = content
+                                        )
                                         val senderDisplay = userDisplayNameCache[sender]
                                             ?: RunConfig.toPublicHandle(sender).removePrefix("@")
                                         val msg = ChatMessage(
@@ -433,19 +645,19 @@ class MatrixApiClient(
                                             senderUserId = sender,
                                             senderHandle = RunConfig.toPublicHandle(sender),
                                             senderDisplayName = senderDisplay,
-                                            body = decryptedBody,
+                                            body = outcome.plaintextBody,
                                             timestamp = ts,
                                             isOutgoing = sender == myUserId,
-                                            isEncrypted = true,
-                                            decryptionFailed = failed
+                                            isEncrypted = !outcome.decryptionFailed,
+                                            decryptionFailed = outcome.decryptionFailed,
+                                            senderDeviceVerified = outcome.senderDeviceVerified
                                         )
                                         roomMessages.add(msg)
                                         lastSenderName = if (sender == myUserId) "أنت" else senderDisplay
-                                        lastMessageText = decryptedBody
+                                        lastMessageText = outcome.plaintextBody
                                         lastMessageTs = ts
                                     }
                                     "m.call.invite", "m.call.answer", "m.call.candidates", "m.call.hangup" -> {
-                                        // Only process recent call signaling events (< 60s old) from remote peer
                                         val ageMs = System.currentTimeMillis() - ts
                                         if (sender != myUserId && ageMs < 60_000L) {
                                             val callId = content.optString("call_id")
@@ -490,7 +702,7 @@ class MatrixApiClient(
 
                         val heroes = summaryObj?.optJSONArray("m.heroes")
                         val heroUserId = if (heroes != null && heroes.length() > 0) heroes.optString(0) else null
-                        val totalMembers = (roomMemberCountCache[roomId] ?: 1).coerceAtLeast(1)
+                        val totalMembers = (roomMemberCountCache[roomId] ?: memberSet.size).coerceAtLeast(1)
 
                         val directPeer = directPeerCache[roomId]
                             ?: heroUserId?.takeIf { totalMembers <= 2 && roomNameCache[roomId].isNullOrBlank() }
@@ -511,7 +723,6 @@ class MatrixApiClient(
                         val peerPresence = directPeer?.let { userPresenceCache[it] ?: PresenceState.OFFLINE }
                             ?: PresenceState.OFFLINE
 
-                        // Track outgoing pending friend invites vs active friends
                         if (isDirectRoom && directPeer != null) {
                             val peerDisplay = userDisplayNameCache[directPeer]
                                 ?: RunConfig.toPublicHandle(directPeer).removePrefix("@")
@@ -542,6 +753,9 @@ class MatrixApiClient(
                         }
 
                         val unreadCount = unreadObj?.optInt("notification_count", 0) ?: 0
+                        val isRoomEnc = roomEncryptedCache[roomId] ?: false
+                        val encNote = roomEncryptionNoteCache[roomId]
+                            ?: if (!isRoomEnc) "هذه الغرفة غير مشفرة (رسائل قياسية غير مشفرة)" else null
 
                         roomSummaries.add(
                             RoomSummary(
@@ -559,7 +773,8 @@ class MatrixApiClient(
                                 },
                                 lastMessageTimestamp = lastMessageTs,
                                 unreadCount = unreadCount,
-                                isEncrypted = roomEncryptedCache[roomId] ?: false,
+                                isEncrypted = isRoomEnc,
+                                encryptionStatusNote = encNote,
                                 avatarSeedColor = AvatarPalette.colorFor(directPeer ?: roomId),
                                 peerPresence = peerPresence
                             )
@@ -622,14 +837,44 @@ class MatrixApiClient(
                     outgoingFriendInvites = outgoingFriendInvites,
                     friends = friendsMap.values.toList(),
                     newMessagesByRoom = newMessagesByRoom,
-                    signalingEvents = signalingEvents
+                    signalingEvents = signalingEvents,
+                    oneTimeKeysCountCurve25519 = signedCurveCount,
+                    changedDeviceUsers = changedDeviceUsers
                 )
             }
         }
 
     // =========================================================================
-    // 4. ROOMS, MESSAGES, CREATION, MEMBERS & INVITE DEEP LINKS
+    // 4. ROOMS, E2EE MESSAGES, CREATION, MEMBERS & INVITE DEEP LINKS
     // =========================================================================
+
+    /**
+     * Checks whether a room has `m.room.encryption` (`m.megolm.v1.aes-sha2`) enabled.
+     * Queries the room's state event on the server if not yet cached locally.
+     */
+    suspend fun checkRoomEncryptionEnabled(roomId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            checkRoomEncryptionEnabledInternal(roomId)
+        }
+
+    private fun checkRoomEncryptionEnabledInternal(roomId: String): Boolean {
+        roomEncryptedCache[roomId]?.let { return it }
+        return try {
+            val encodedRoom = encodePathSegment(roomId)
+            val stateObj = executeGet("/_matrix/client/v3/rooms/$encodedRoom/state/m.room.encryption")
+            val alg = stateObj.optString("algorithm")
+            val enabled = alg == RunConfig.ROOM_ENCRYPTION_ALGORITHM
+            roomEncryptedCache[roomId] = enabled
+            if (!enabled) {
+                roomEncryptionNoteCache[roomId] = "هذه الغرفة غير مشفرة (رسائل قياسية غير مشفرة)"
+            }
+            enabled
+        } catch (_: Exception) {
+            roomEncryptedCache[roomId] = false
+            roomEncryptionNoteCache[roomId] = "هذه الغرفة غير مشفرة (رسائل قياسية غير مشفرة)"
+            false
+        }
+    }
 
     suspend fun fetchRoomMessages(roomId: String, limit: Int = 60): Result<List<ChatMessage>> =
         withContext(Dispatchers.IO) {
@@ -664,13 +909,22 @@ class MatrixApiClient(
                                         body = body,
                                         timestamp = ts,
                                         isOutgoing = sender == myUserId,
-                                        isEncrypted = false
+                                        isEncrypted = false,
+                                        decryptionFailed = false,
+                                        senderDeviceVerified = false
                                     )
                                 )
                             }
                         }
                         RunConfig.ROOM_EVENT_ENCRYPTED -> {
-                            val (decrypted, failed) = pinBackupManager.decryptRoomMessage(roomId, content)
+                            if (content.optString("algorithm") == RunConfig.ROOM_ENCRYPTION_ALGORITHM) {
+                                roomEncryptedCache[roomId] = true
+                            }
+                            val outcome = olmCryptoManager.decryptMegolmRoomMessage(
+                                roomId = roomId,
+                                senderUserId = sender,
+                                content = content
+                            )
                             result.add(
                                 ChatMessage(
                                     eventId = eventId,
@@ -678,11 +932,12 @@ class MatrixApiClient(
                                     senderUserId = sender,
                                     senderHandle = RunConfig.toPublicHandle(sender),
                                     senderDisplayName = senderDisplay,
-                                    body = decrypted,
+                                    body = outcome.plaintextBody,
                                     timestamp = ts,
                                     isOutgoing = sender == myUserId,
-                                    isEncrypted = true,
-                                    decryptionFailed = failed
+                                    isEncrypted = !outcome.decryptionFailed,
+                                    decryptionFailed = outcome.decryptionFailed,
+                                    senderDeviceVerified = outcome.senderDeviceVerified
                                 )
                             )
                         }
@@ -692,23 +947,58 @@ class MatrixApiClient(
             }
         }
 
-    suspend fun sendRoomMessage(roomId: String, text: String, encryptWithRoomKey: Boolean = false): Result<ChatMessage> =
+    /**
+     * Sends a message in `roomId`.
+     * - If the room is encrypted (`m.room.encryption` with `m.megolm.v1.aes-sha2`), exchanges
+     *   the Megolm session key via Olm (`m.room.encrypted` to-device) with all member devices
+     *   and sends a real `m.room.encrypted` Megolm event interoperable with Element.
+     * - If the room is NOT encrypted, sends a standard `m.room.message` event with
+     *   `isEncrypted = false` and never claims the message is encrypted.
+     */
+    suspend fun sendRoomMessage(roomId: String, text: String): Result<ChatMessage> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val myUserId = sessionStore.getInternalUserId() ?: error("غير مسجل الدخول")
+                val myDeviceId = sessionStore.getDeviceId() ?: error("معرف الجهاز غير متوفر")
                 val cleanText = text.trim()
                 require(cleanText.isNotEmpty()) { "الرسالة فارغة" }
 
+                val isEncryptedRoom = checkRoomEncryptionEnabledInternal(roomId)
                 val encodedRoom = encodePathSegment(roomId)
                 val txnId = "runv2_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}"
 
-                val eventId = if (encryptWithRoomKey) {
-                    val encPayload = pinBackupManager.encryptRoomMessage(roomId, cleanText)
+                if (isEncryptedRoom) {
+                    runCatching {
+                        ensureOlmKeysUploadedInternal(
+                            currentServerOneTimeKeyCount = 0,
+                            forceIncludeDeviceKeys = !sessionStore.areDeviceKeysUploaded()
+                        )
+                    }
+                    shareMegolmSessionWithRoomMembersInternal(roomId, myUserId, myDeviceId)
+                    val megolmPayload = olmCryptoManager.encryptMegolmRoomMessage(
+                        roomId = roomId,
+                        myDeviceId = myDeviceId,
+                        plaintext = cleanText
+                    )
                     val resp = executePut(
                         "/_matrix/client/v3/rooms/$encodedRoom/send/${RunConfig.ROOM_EVENT_ENCRYPTED}/$txnId",
-                        encPayload
+                        megolmPayload
                     )
-                    resp.optString("event_id", txnId)
+                    val eventId = resp.optString("event_id", txnId)
+                    ChatMessage(
+                        eventId = eventId,
+                        roomId = roomId,
+                        senderUserId = myUserId,
+                        senderHandle = RunConfig.toPublicHandle(myUserId),
+                        senderDisplayName = sessionStore.getDisplayName(),
+                        body = cleanText,
+                        timestamp = System.currentTimeMillis(),
+                        isOutgoing = true,
+                        isEncrypted = true,
+                        decryptionFailed = false,
+                        senderDeviceVerified = true,
+                        isDelivered = true
+                    )
                 } else {
                     val msgPayload = JSONObject().apply {
                         put("msgtype", "m.text")
@@ -718,30 +1008,37 @@ class MatrixApiClient(
                         "/_matrix/client/v3/rooms/$encodedRoom/send/m.room.message/$txnId",
                         msgPayload
                     )
-                    resp.optString("event_id", txnId)
+                    val eventId = resp.optString("event_id", txnId)
+                    ChatMessage(
+                        eventId = eventId,
+                        roomId = roomId,
+                        senderUserId = myUserId,
+                        senderHandle = RunConfig.toPublicHandle(myUserId),
+                        senderDisplayName = sessionStore.getDisplayName(),
+                        body = cleanText,
+                        timestamp = System.currentTimeMillis(),
+                        isOutgoing = true,
+                        isEncrypted = false,
+                        decryptionFailed = false,
+                        senderDeviceVerified = false,
+                        isDelivered = true
+                    )
                 }
-
-                ChatMessage(
-                    eventId = eventId,
-                    roomId = roomId,
-                    senderUserId = myUserId,
-                    senderHandle = RunConfig.toPublicHandle(myUserId),
-                    senderDisplayName = sessionStore.getDisplayName(),
-                    body = cleanText,
-                    timestamp = System.currentTimeMillis(),
-                    isOutgoing = true,
-                    isEncrypted = encryptWithRoomKey,
-                    isDelivered = true
-                )
             }
         }
 
+    /**
+     * Creates a new group room with End-to-End Encryption (`m.megolm.v1.aes-sha2`)
+     * enabled by default in `initial_state`. Verifies whether encryption was applied
+     * and sets `isEncrypted` honestly.
+     */
     suspend fun createGroupRoom(
         name: String,
         topic: String,
         invitedHandlesOrIds: List<String>
     ): Result<RoomSummary> = withContext(Dispatchers.IO) {
         runCatching {
+            val myUserId = sessionStore.getInternalUserId() ?: error("غير مسجل الدخول")
             val cleanName = name.trim()
             require(cleanName.isNotEmpty()) { "يرجى إدخال اسم الغرفة" }
 
@@ -755,12 +1052,19 @@ class MatrixApiClient(
             val aliasLocalpart = permanentCode.lowercase()
 
             val inviteUserIds = invitedHandlesOrIds.map { RunConfig.toInternalUserId(it) }.distinct()
-            val tempRoomKeyB64 = android.util.Base64.encodeToString(
-                ByteArray(32).also { java.security.SecureRandom().nextBytes(it) },
-                android.util.Base64.NO_WRAP
-            )
 
-            val initialState = JSONArray()
+            // Enable standard Matrix Megolm encryption by default in new rooms
+            val encryptionStateEvent = JSONObject().apply {
+                put("type", "m.room.encryption")
+                put("state_key", "")
+                put(
+                    "content",
+                    JSONObject().apply {
+                        put("algorithm", RunConfig.ROOM_ENCRYPTION_ALGORITHM)
+                    }
+                )
+            }
+            val initialState = JSONArray().put(encryptionStateEvent)
 
             val payload = JSONObject().apply {
                 put("name", cleanName)
@@ -776,12 +1080,17 @@ class MatrixApiClient(
 
             val resp = executePost("/_matrix/client/v3/createRoom", payload)
             val roomId = resp.getString("room_id")
-            pinBackupManager.storeRoomSecretKeyBase64(roomId, tempRoomKeyB64)
+
+            val encryptionVerified = checkRoomEncryptionEnabledInternal(roomId)
+            if (encryptionVerified) {
+                olmCryptoManager.getOrCreateOutboundRoomKeyShareData(roomId)
+            }
 
             roomNameCache[roomId] = cleanName
             roomTopicCache[roomId] = topic.trim()
             roomAliasCache[roomId] = "#$aliasLocalpart:${RunConfig.SERVER_DOMAIN}"
-            roomEncryptedCache[roomId] = false
+            roomEncryptedCache[roomId] = encryptionVerified
+            roomJoinedMembersCache[roomId] = (inviteUserIds + myUserId).toMutableSet()
 
             RoomSummary(
                 roomId = roomId,
@@ -793,40 +1102,62 @@ class MatrixApiClient(
                 memberCount = inviteUserIds.size + 1,
                 onlineCount = 1,
                 lastMessageSender = "أنت",
-                lastMessageBody = "تم إنشاء الغرفة · الكود $permanentCode",
+                lastMessageBody = if (encryptionVerified) {
+                    "تم إنشاء الغرفة المشفرة · الكود $permanentCode"
+                } else {
+                    "تم إنشاء الغرفة (غير مشفرة) · الكود $permanentCode"
+                },
                 lastMessageTimestamp = System.currentTimeMillis(),
                 unreadCount = 0,
-                isEncrypted = false,
+                isEncrypted = encryptionVerified,
+                encryptionStatusNote = if (encryptionVerified) null else "تعذر تفعيل التشفير في هذه الغرفة؛ الرسائل فيها غير مشفرة",
                 avatarSeedColor = AvatarPalette.colorFor(roomId)
             )
         }
     }
 
+    /**
+     * Creates or opens a 1-to-1 direct room with End-to-End Encryption (`m.megolm.v1.aes-sha2`)
+     * enabled by default in `initial_state`.
+     */
     suspend fun createOrOpenDirectChat(targetHandleOrUserId: String): Result<String> =
         withContext(Dispatchers.IO) {
             runCatching {
+                val myUserId = sessionStore.getInternalUserId() ?: error("غير مسجل الدخول")
                 val targetUserId = RunConfig.toInternalUserId(targetHandleOrUserId)
-                // Check if we already have a direct room cached
                 val existingRoom = directPeerCache.entries.firstOrNull { it.value == targetUserId }?.key
                 if (existingRoom != null) {
                     return@runCatching existingRoom
                 }
 
-                val tempRoomKeyB64 = android.util.Base64.encodeToString(
-                    ByteArray(32).also { java.security.SecureRandom().nextBytes(it) },
-                    android.util.Base64.NO_WRAP
-                )
+                val encryptionStateEvent = JSONObject().apply {
+                    put("type", "m.room.encryption")
+                    put("state_key", "")
+                    put(
+                        "content",
+                        JSONObject().apply {
+                            put("algorithm", RunConfig.ROOM_ENCRYPTION_ALGORITHM)
+                        }
+                    )
+                }
 
                 val payload = JSONObject().apply {
                     put("is_direct", true)
                     put("preset", "trusted_private_chat")
                     put("invite", JSONArray().put(targetUserId))
+                    put("initial_state", JSONArray().put(encryptionStateEvent))
                 }
 
                 val resp = executePost("/_matrix/client/v3/createRoom", payload)
                 val roomId = resp.getString("room_id")
                 directPeerCache[roomId] = targetUserId
-                pinBackupManager.storeRoomSecretKeyBase64(roomId, tempRoomKeyB64)
+                roomJoinedMembersCache[roomId] = mutableSetOf(myUserId, targetUserId)
+
+                val encryptionVerified = checkRoomEncryptionEnabledInternal(roomId)
+                roomEncryptedCache[roomId] = encryptionVerified
+                if (encryptionVerified) {
+                    olmCryptoManager.getOrCreateOutboundRoomKeyShareData(roomId)
+                }
                 roomId
             }
         }
@@ -837,7 +1168,9 @@ class MatrixApiClient(
                 val target = RunConfig.toInternalRoomAliasOrId(codeOrRoomIdOrLink)
                 val encoded = encodePathSegment(target)
                 val resp = executePost("/_matrix/client/v3/join/$encoded", JSONObject())
-                resp.optString("room_id", target)
+                val joinedRoomId = resp.optString("room_id", target)
+                checkRoomEncryptionEnabledInternal(joinedRoomId)
+                joinedRoomId
             }
         }
 
@@ -850,6 +1183,29 @@ class MatrixApiClient(
             }
         }
 
+    private fun getOrFetchRoomMemberUserIdsInternal(roomId: String, myUserId: String): Set<String> {
+        val cached = roomJoinedMembersCache[roomId]
+        if (cached != null && cached.size > 1) {
+            return cached
+        }
+        return runCatching {
+            val encoded = encodePathSegment(roomId)
+            val resp = executeGet("/_matrix/client/v3/rooms/$encoded/members")
+            val chunk = resp.optJSONArray("chunk") ?: JSONArray()
+            val set = mutableSetOf(myUserId)
+            for (i in 0 until chunk.length()) {
+                val ev = chunk.getJSONObject(i)
+                val userId = ev.optString("state_key")
+                val membership = ev.optJSONObject("content")?.optString("membership")
+                if (userId.isNotBlank() && (membership == "join" || membership == "invite")) {
+                    set.add(userId)
+                }
+            }
+            roomJoinedMembersCache[roomId] = set
+            set
+        }.getOrDefault(setOf(myUserId))
+    }
+
     suspend fun fetchRoomMembers(roomId: String): Result<List<RoomMember>> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -858,6 +1214,22 @@ class MatrixApiClient(
                 val resp = executeGet("/_matrix/client/v3/rooms/$encoded/members")
                 val chunk = resp.optJSONArray("chunk") ?: JSONArray()
                 val members = mutableListOf<RoomMember>()
+                val memberIds = mutableListOf<String>()
+
+                for (i in 0 until chunk.length()) {
+                    val ev = chunk.getJSONObject(i)
+                    val userId = ev.optString("state_key")
+                    val content = ev.optJSONObject("content") ?: continue
+                    val membership = content.optString("membership")
+                    if (membership != "join" && membership != "invite") continue
+                    if (userId.isNotBlank()) memberIds.add(userId)
+                }
+
+                // Query device keys for room members so RoomInfoScreen can display verified device counts
+                runCatching { queryDevicesForUsersInternal(memberIds) }
+                val knownDevicesByUser = olmCryptoManager
+                    .getKnownDevicesForUsers(memberIds)
+                    .groupBy { it.userId }
 
                 for (i in 0 until chunk.length()) {
                     val ev = chunk.getJSONObject(i)
@@ -869,6 +1241,8 @@ class MatrixApiClient(
                     val handle = RunConfig.toPublicHandle(userId)
                     val displayName = content.optString("displayname")
                         .ifBlank { handle.removePrefix("@") }
+                    val userDevices = knownDevicesByUser[userId].orEmpty()
+                    val verifiedCount = userDevices.count { it.signatureVerified }
                     val role = when {
                         userId == myUserId -> "أنت · عضو"
                         membership == "invite" -> "مدعو"
@@ -882,7 +1256,9 @@ class MatrixApiClient(
                             roleLabel = role,
                             membership = membership,
                             presence = userPresenceCache[userId] ?: PresenceState.OFFLINE,
-                            avatarSeedColor = AvatarPalette.colorFor(userId)
+                            avatarSeedColor = AvatarPalette.colorFor(userId),
+                            verifiedDeviceCount = verifiedCount,
+                            totalDeviceCount = userDevices.size
                         )
                     )
                 }
@@ -1142,8 +1518,10 @@ class MatrixApiClient(
         }
 
     // =========================================================================
-    // INTERNAL HELPERS
+    // INTERNAL HELPERS & HONEST ERROR MAPPING (Task 3)
     // =========================================================================
+
+    fun isRoomCurrentlyEncrypted(roomId: String): Boolean = roomEncryptedCache[roomId] ?: false
 
     private fun fetchDisplayNameInternal(userId: String): String? {
         return runCatching {
@@ -1190,7 +1568,7 @@ class MatrixApiClient(
         httpClient.newCall(builder.build()).execute().use { resp ->
             val raw = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                throw IllegalStateException(mapErrorToArabic(raw, resp.code))
+                throw IllegalStateException(mapErrorToArabic(raw, resp.code, pathAndQuery))
             }
             return if (raw.isBlank()) JSONObject() else JSONObject(raw)
         }
@@ -1207,7 +1585,7 @@ class MatrixApiClient(
         httpClient.newCall(builder.build()).execute().use { resp ->
             val raw = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                throw IllegalStateException(mapErrorToArabic(raw, resp.code))
+                throw IllegalStateException(mapErrorToArabic(raw, resp.code, path))
             }
             return if (raw.isBlank()) JSONObject() else JSONObject(raw)
         }
@@ -1224,7 +1602,7 @@ class MatrixApiClient(
         httpClient.newCall(builder.build()).execute().use { resp ->
             val raw = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                throw IllegalStateException(mapErrorToArabic(raw, resp.code))
+                throw IllegalStateException(mapErrorToArabic(raw, resp.code, path))
             }
             return if (raw.isBlank()) JSONObject() else JSONObject(raw)
         }
@@ -1235,20 +1613,70 @@ class MatrixApiClient(
     }
 
     /**
-     * Maps backend error responses to clean Arabic messages without exposing
-     * "Matrix", domain names, or protocol terms.
+     * Maps backend error responses to honest, cause-accurate Arabic messages without
+     * misleading the user.
+     *
+     * Specifically:
+     * - When registration returns 403 `M_FORBIDDEN` with `"Registration has been disabled"`
+     *   (or disabled registration), displays `"التسجيل مغلق على هذا السيرفر"` instead of
+     *   `"اسم المستخدم أو كلمة المرور غير صحيحة"`.
+     * - Distinguishes login credential failures from room/permission `M_FORBIDDEN` errors
+     *   and surfaces the true error reason.
      */
-    private fun mapErrorToArabic(rawResponse: String, httpCode: Int): String {
-        val errCode = runCatching { JSONObject(rawResponse).optString("errcode") }.getOrDefault("")
+    internal fun mapErrorToArabic(
+        rawResponse: String,
+        httpCode: Int,
+        endpointPath: String = ""
+    ): String {
+        val parsed = runCatching { JSONObject(rawResponse) }.getOrNull()
+        val errCode = parsed?.optString("errcode").orEmpty()
+        val errMsg = parsed?.optString("error").orEmpty()
+
+        val isRegistrationDisabled =
+            errMsg.contains("Registration has been disabled", ignoreCase = true) ||
+                (endpointPath.contains("/register") &&
+                    (errCode == "M_FORBIDDEN" || httpCode == 403) &&
+                    (errMsg.contains("disabled", ignoreCase = true) || errMsg.isBlank()))
+
         return when {
-            errCode == "M_FORBIDDEN" || httpCode == 403 -> "اسم المستخدم أو كلمة المرور غير صحيحة"
-            errCode == "M_USER_IN_USE" -> "اسم المستخدم هذا محجوز بالفعل، اختر اسمًا آخر"
-            errCode == "M_INVALID_USERNAME" -> "اسم المستخدم يحتوي على رموز غير مسموحة (استخدم حروفًا إنجليزية صغيرة وأرقامًا)"
-            errCode == "M_ROOM_IN_USE" -> "كود الغرفة مستخدم بالفعل"
-            errCode == "M_NOT_FOUND" || httpCode == 404 -> "لم يتم العثور على الحساب أو الغرفة المطلوبة"
-            errCode == "M_LIMIT_EXCEEDED" || httpCode == 429 -> "محاولات كثيرة متتالية، يرجى الانتظار قليلاً ثم المحاولة"
-            httpCode in 500..599 -> "الخدمة مشغولة حاليًا، يرجى المحاولة بعد لحظات"
-            else -> "تعذر إتمام العملية ($httpCode)"
+            isRegistrationDisabled -> "التسجيل مغلق على هذا السيرفر"
+            errCode == "M_USER_DEACTIVATED" || errMsg.contains("deactivated", ignoreCase = true) ->
+                "هذا الحساب معطل ولا يمكن الدخول به"
+            (errCode == "M_FORBIDDEN" || httpCode == 403) && endpointPath.contains("/login") ->
+                "اسم المستخدم أو كلمة المرور غير صحيحة"
+            errCode == "M_FORBIDDEN" || httpCode == 403 -> {
+                if (errMsg.isNotBlank()) {
+                    "غير مسموح بهذه العملية: $errMsg"
+                } else {
+                    "غير مسموح بتنفيذ هذه العملية (403)"
+                }
+            }
+            errCode == "M_USER_IN_USE" ->
+                "اسم المستخدم هذا محجوز بالفعل، اختر اسمًا آخر"
+            errCode == "M_INVALID_USERNAME" ->
+                "اسم المستخدم يحتوي على رموز غير مسموحة (استخدم حروفًا إنجليزية صغيرة وأرقامًا)"
+            errCode == "M_EXCLUSIVE" ->
+                "اسم المستخدم هذا محجوز للنظام ولا يمكن تسجيله"
+            errCode == "M_WEAK_PASSWORD" ->
+                "كلمة المرور ضعيفة جدًا، يرجى اختيار كلمة مرور أقوى"
+            errCode == "M_UNKNOWN_TOKEN" || errCode == "M_MISSING_TOKEN" || httpCode == 401 ->
+                "انتهت صلاحية الجلسة أو رمز الدخول غير صالح، يرجى تسجيل الدخول مجددًا"
+            errCode == "M_ROOM_IN_USE" ->
+                "كود الغرفة مستخدم بالفعل، يرجى المحاولة مرة أخرى"
+            errCode == "M_BAD_JSON" || errCode == "M_NOT_JSON" ->
+                "بيانات الطلب غير صالحة ($errCode)"
+            errCode == "M_NOT_FOUND" || httpCode == 404 ->
+                "لم يتم العثور على الحساب أو الغرفة المطلوبة"
+            errCode == "M_LIMIT_EXCEEDED" || httpCode == 429 ->
+                "محاولات كثيرة متتالية، يرجى الانتظار قليلاً ثم المحاولة"
+            errCode == "M_TOO_LARGE" || httpCode == 413 ->
+                "حجم البيانات المرسلة أكبر من الحد المسموح به"
+            httpCode in 500..599 ->
+                "خطأ في الخادم ($httpCode)، يرجى المحاولة بعد لحظات"
+            errMsg.isNotBlank() ->
+                "تعذر إتمام العملية ($httpCode): $errMsg"
+            else ->
+                "تعذر إتمام العملية (رمز الحالة $httpCode)"
         }
     }
 }

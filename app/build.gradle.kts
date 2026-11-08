@@ -11,8 +11,8 @@ android {
         applicationId = "com.takidz.runv2"
         minSdk = 26
         targetSdk = 34
-        versionCode = 200
-        versionName = "2.0.0"
+        versionCode = 210
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -78,6 +78,9 @@ dependencies {
 
     // Networking (Matrix Client-Server API)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Official Matrix Olm/Megolm E2E Encryption SDK (libolm JNI bindings)
+    implementation("org.matrix.android:olm-sdk:3.2.11")
 
     // Encrypted Local Session & PIN Vault Storage
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

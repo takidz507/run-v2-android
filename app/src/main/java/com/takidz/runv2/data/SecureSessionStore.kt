@@ -9,7 +9,8 @@ import org.json.JSONObject
 
 /**
  * Encrypted local storage for the active Run session, PIN verification hash,
- * local E2EE room keys, call settings, and call history.
+ * serialized OlmAccount, Olm 1-to-1 sessions, Megolm inbound/outbound group sessions,
+ * verified device keys, call settings, and call history.
  *
  * SECURITY RULE: Never store or log the user's plaintext password.
  */
@@ -74,11 +75,59 @@ class SecureSessionStore(context: Context) {
     fun isPinConfigured(): Boolean = prefs.getBoolean(KEY_PIN_CONFIGURED, false)
     fun getPinDigest(): String? = prefs.getString(KEY_PIN_DIGEST, null)
 
-    fun saveRoomKeyVaultJson(json: String) {
-        prefs.edit().putString(KEY_ROOM_KEYS_JSON, json).apply()
+    // =========================================================================
+    // OLM & MEGOLM CRYPTO STORAGE
+    // =========================================================================
+
+    fun saveSerializedOlmAccount(base64: String) {
+        prefs.edit().putString(KEY_OLM_ACCOUNT_B64, base64).apply()
     }
 
-    fun getRoomKeyVaultJson(): String = prefs.getString(KEY_ROOM_KEYS_JSON, "{}") ?: "{}"
+    fun getSerializedOlmAccount(): String? = prefs.getString(KEY_OLM_ACCOUNT_B64, null)
+
+    fun setDeviceKeysUploaded(uploaded: Boolean) {
+        prefs.edit().putBoolean(KEY_DEVICE_KEYS_UPLOADED, uploaded).apply()
+    }
+
+    fun areDeviceKeysUploaded(): Boolean = prefs.getBoolean(KEY_DEVICE_KEYS_UPLOADED, false)
+
+    fun saveOlmSessionsJson(json: String) {
+        prefs.edit().putString(KEY_OLM_SESSIONS_JSON, json).apply()
+    }
+
+    fun getOlmSessionsJson(): String = prefs.getString(KEY_OLM_SESSIONS_JSON, "{}") ?: "{}"
+
+    fun saveOutboundMegolmSessionsJson(json: String) {
+        prefs.edit().putString(KEY_OUTBOUND_MEGOLM_JSON, json).apply()
+    }
+
+    fun getOutboundMegolmSessionsJson(): String =
+        prefs.getString(KEY_OUTBOUND_MEGOLM_JSON, "{}") ?: "{}"
+
+    fun saveInboundMegolmSessionsJson(json: String) {
+        prefs.edit().putString(KEY_INBOUND_MEGOLM_JSON, json).apply()
+    }
+
+    fun getInboundMegolmSessionsJson(): String =
+        prefs.getString(KEY_INBOUND_MEGOLM_JSON, "{}") ?: "{}"
+
+    fun saveKnownDevicesJson(json: String) {
+        prefs.edit().putString(KEY_KNOWN_DEVICES_JSON, json).apply()
+    }
+
+    fun getKnownDevicesJson(): String =
+        prefs.getString(KEY_KNOWN_DEVICES_JSON, "{}") ?: "{}"
+
+    fun saveSharedMegolmTargetsJson(json: String) {
+        prefs.edit().putString(KEY_SHARED_MEGOLM_TARGETS_JSON, json).apply()
+    }
+
+    fun getSharedMegolmTargetsJson(): String =
+        prefs.getString(KEY_SHARED_MEGOLM_TARGETS_JSON, "{}") ?: "{}"
+
+    // =========================================================================
+    // THEME, CALL QUALITY & CALL LOGS
+    // =========================================================================
 
     fun saveThemeMode(mode: ThemeMode) {
         prefs.edit().putString(KEY_THEME_MODE, mode.name).apply()
@@ -163,7 +212,13 @@ class SecureSessionStore(context: Context) {
         private const val KEY_NEXT_BATCH = "sync_next_batch"
         private const val KEY_PIN_CONFIGURED = "pin_configured"
         private const val KEY_PIN_DIGEST = "pin_digest_hex"
-        private const val KEY_ROOM_KEYS_JSON = "room_keys_vault_json"
+        private const val KEY_OLM_ACCOUNT_B64 = "olm_account_serialized_b64"
+        private const val KEY_DEVICE_KEYS_UPLOADED = "olm_device_keys_uploaded"
+        private const val KEY_OLM_SESSIONS_JSON = "olm_sessions_vault_json"
+        private const val KEY_OUTBOUND_MEGOLM_JSON = "outbound_megolm_sessions_json"
+        private const val KEY_INBOUND_MEGOLM_JSON = "inbound_megolm_sessions_json"
+        private const val KEY_KNOWN_DEVICES_JSON = "known_devices_json"
+        private const val KEY_SHARED_MEGOLM_TARGETS_JSON = "shared_megolm_targets_json"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_CALL_QUALITY = "call_quality_mode"
         private const val KEY_CALL_LOGS = "call_logs_json"

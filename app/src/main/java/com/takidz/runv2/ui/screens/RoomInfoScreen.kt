@@ -43,21 +43,25 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.takidz.runv2.data.DeviceIdentity
 import com.takidz.runv2.data.RoomMember
 import com.takidz.runv2.data.RoomSummary
 import com.takidz.runv2.data.RunConfig
 import com.takidz.runv2.ui.theme.LocalRunColors
 
 /**
- * Design B Room Details & Invite Screen.
- * - Real member list fetched from the server.
+ * Design B Room Details, E2EE Device Verification & Invite Screen.
+ * - Honest E2EE encryption status card (`Olm/Megolm` vs unencrypted).
  * - Permanent Share Code and `run://join/<code>` app invite link.
  * - 3 working buttons: Copy Link, Copy Code, and Share (via Android Share Sheet).
+ * - Real member list and Olm/Ed25519 device verification list.
  */
 @Composable
 fun RoomInfoScreen(
     room: RoomSummary,
     members: List<RoomMember>,
+    devices: List<DeviceIdentity>,
+    onVerifyDevice: (DeviceIdentity) -> Unit,
     onBack: () -> Unit
 ) {
     val colors = LocalRunColors.current
@@ -123,6 +127,43 @@ fun RoomInfoScreen(
         }
 
         LazyColumn(modifier = Modifier.fillMaxSize()) {
+            // Encryption Status Box
+            item {
+                SectionLabel("حالة التشفير")
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(colors.surface)
+                        .border(1.dp, colors.line, RoundedCornerShape(16.dp))
+                        .padding(14.dp)
+                ) {
+                    Text(
+                        text = if (room.isEncrypted) {
+                            "🔒 التشفير من الطرف إلى الطرف مفعّل (Olm / Megolm)"
+                        } else {
+                            "⚠️ هذه الغرفة غير مشفرة"
+                        },
+                        color = if (room.isEncrypted) colors.online else colors.danger,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (room.isEncrypted) {
+                            "الرسائل تُشفر بمفاتيح Megolm وتُتبادل عبر Olm مع التحقق من تواقيع الأجهزة (متوافق مع Element)."
+                        } else {
+                            room.encryptionStatusNote
+                                ?: "تعذر تفعيل التشفير في هذه الغرفة؛ الرسائل المرسلة فيها غير مشفرة."
+                        },
+                        color = colors.inkSoft,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                }
+            }
+
             item {
                 SectionLabel("دعوة إلى الغرفة")
             }
@@ -235,9 +276,7 @@ fun RoomInfoScreen(
                             type = "text/plain"
                             putExtra(
                                 Intent.EXTRA_TEXT,
-                                """انضم إلى غرفة "${room.name}" في تطبيق Run:
-الرابط: $inviteLink
-الكود: ${room.roomCode}"""
+                                "انضم إلى غرفة \"${room.name}\" في تطبيق Run:\nالرابط: $inviteLink\nالكود: ${room.roomCode}"
                             )
                         }
                         context.startActivity(Intent.createChooser(shareIntent, "مشاركة دعوة Run"))
@@ -301,6 +340,51 @@ fun RoomInfoScreen(
                     }
                     RunChip(text = member.roleLabel)
                 }
+            }
+
+            if (devices.isNotEmpty()) {
+                item {
+                    SectionLabel("أجهزة التشفير والتحقق (${devices.size})")
+                }
+                items(devices, key = { "${it.userId}|${it.deviceId}" }) { dev ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 5.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(colors.surface)
+                            .border(1.dp, colors.line, RoundedCornerShape(14.dp))
+                            .padding(12.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "${RunConfig.toPublicHandle(dev.userId)} · ${dev.deviceId}",
+                                    color = colors.ink,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                                    Text(
+                                        text = "Ed25519: ${dev.formattedFingerprint}",
+                                        color = colors.inkSoft,
+                                        fontSize = 11.sp
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            SmallPillButton(
+                                text = if (dev.manuallyVerified) "موثّق ✓" else "توثيق الجهاز",
+                                filled = dev.manuallyVerified,
+                                onClick = { onVerifyDevice(dev) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                Spacer(modifier = Modifier.height(24.dp))
             }
         }
     }

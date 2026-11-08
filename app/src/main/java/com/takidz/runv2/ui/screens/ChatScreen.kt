@@ -24,6 +24,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.HorizontalDivider
@@ -52,6 +54,8 @@ import com.takidz.runv2.ui.theme.LocalRunColors
 /**
  * Design B Full-Screen Chat Screen.
  * - Real sending and receiving via `/sync` (messages arriving while open appear automatically).
+ * - Honest E2EE status: clearly shows whether the room uses Olm/Megolm E2E encryption
+ *   or is unencrypted, and never claims an unencrypted room/message is encrypted.
  * - Small, clean message font (13.5sp) as requested in Design B.
  * - Voice call, Video call, and Room Info / Invite buttons in the header.
  */
@@ -120,21 +124,31 @@ fun ChatScreen(
                     .weight(1f)
                     .clickable { onOpenRoomInfo() }
             ) {
-                Text(
-                    text = room.name,
-                    color = colors.ink,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                val statusText = if (room.isDirect) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = room.name,
+                        color = colors.ink,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Icon(
+                        imageVector = if (room.isEncrypted) Icons.Outlined.Lock else Icons.Outlined.LockOpen,
+                        contentDescription = if (room.isEncrypted) "غرفة مشفرة" else "غرفة غير مشفرة",
+                        tint = if (room.isEncrypted) colors.online else colors.danger,
+                        modifier = Modifier.size(13.dp)
+                    )
+                }
+                val baseStatus = if (room.isDirect) {
                     if (room.peerPresence == PresenceState.ONLINE) "متصل الآن" else room.roomCode
                 } else {
                     "${room.memberCount} عضوًا · الكود ${room.roomCode}"
                 }
+                val encLabel = if (room.isEncrypted) "مشفرة E2E" else "غير مشفرة"
                 Text(
-                    text = statusText,
+                    text = "$baseStatus · $encLabel",
                     color = colors.inkSoft,
                     fontSize = 11.5.sp,
                     maxLines = 1,
@@ -216,9 +230,15 @@ fun ChatScreen(
                         .padding(vertical = 6.dp),
                     contentAlignment = Alignment.Center
                 ) {
+                    val bannerText = if (room.isEncrypted) {
+                        "🔒 تشفير من الطرف إلى الطرف مفعّل (Olm/Megolm)"
+                    } else {
+                        room.encryptionStatusNote
+                            ?: "⚠️ هذه الغرفة غير مشفرة — الرسائل فيها تُرسل بدون تشفير طرف-لطرف"
+                    }
                     Text(
-                        text = "سجل الغرفة دائم ومحفوظ في حسابك",
-                        color = colors.inkSoft,
+                        text = bannerText,
+                        color = if (room.isEncrypted) colors.inkSoft else colors.danger,
                         fontSize = 11.sp,
                         modifier = Modifier
                             .clip(RoundedCornerShape(999.dp))
@@ -264,7 +284,12 @@ fun ChatScreen(
                     modifier = Modifier.fillMaxWidth(),
                     decorationBox = { inner ->
                         if (inputText.isEmpty()) {
-                            Text("اكتب رسالة…", color = colors.inkSoft, fontSize = 13.5.sp)
+                            val hint = if (room.isEncrypted) {
+                                "اكتب رسالة مشفرة…"
+                            } else {
+                                "اكتب رسالة (غير مشفرة)…"
+                            }
+                            Text(hint, color = colors.inkSoft, fontSize = 13.5.sp)
                         }
                         inner()
                     }
@@ -334,7 +359,7 @@ private fun MessageBubble(
             // Small compact chat text (13.5sp, normal weight)
             Text(
                 text = message.body,
-                color = textColor,
+                color = if (message.decryptionFailed) colors.danger else textColor,
                 fontSize = 13.5.sp,
                 lineHeight = 20.sp
             )
@@ -343,6 +368,13 @@ private fun MessageBubble(
                 modifier = Modifier.align(Alignment.End),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                if (message.isEncrypted && !message.decryptionFailed) {
+                    Text(
+                        text = "🔒 ",
+                        color = textColor.copy(alpha = 0.7f),
+                        fontSize = 9.5.sp
+                    )
+                }
                 Text(
                     text = formatShortTime(message.timestamp),
                     color = textColor.copy(alpha = 0.65f),
